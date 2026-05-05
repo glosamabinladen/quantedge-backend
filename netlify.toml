@@ -33,3 +33,5 @@
     Access-Control-Allow-Origin = "https://glosamabinladen.github.io"
     Access-Control-Allow-Methods = "GET, POST, OPTIONS"
     Access-Control-Allow-Headers = "Content-Type"
+[build.environment]
+  NODE_VERSION = "18"
