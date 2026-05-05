@@ -1,0 +1,35 @@
+[build]
+  publish = "public"
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"
+
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
+
+# Scheduled Functions
+# Morning Briefing — 9:00 AM EST (14:00 UTC)
+[[scheduledFunctions]]
+  function = "morning-briefing"
+  cron = "0 14 * * 1-5"
+
+# EOD Debrief — 4:00 PM EST (21:00 UTC)
+[[scheduledFunctions]]
+  function = "eod-debrief"
+  cron = "0 21 * * 1-5"
+
+# CORS headers for GitHub Pages frontend
+[[headers]]
+  for = "/api/*"
+  [headers.values]
+    Access-Control-Allow-Origin = "https://glosamabinladen.github.io"
+    Access-Control-Allow-Methods = "GET, POST, OPTIONS"
+    Access-Control-Allow-Headers = "Content-Type, Authorization"
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Access-Control-Allow-Origin = "https://glosamabinladen.github.io"
+    Access-Control-Allow-Methods = "GET, POST, OPTIONS"
+    Access-Control-Allow-Headers = "Content-Type"

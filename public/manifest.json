@@ -1,0 +1,82 @@
+{
+  "name": "QuantEdge Pro",
+  "short_name": "QE Pro",
+  "description": "AI-powered trading terminal with real market data and paper trading",
+  "start_url": "/quantedge-pro/",
+  "scope": "/quantedge-pro/",
+  "display": "standalone",
+  "orientation": "any",
+  "theme_color": "#00ff88",
+  "background_color": "#0a0a0a",
+  "categories": ["finance", "productivity"],
+  "lang": "en-US",
+  "icons": [
+    {
+      "src": "/quantedge-pro/icons/icon-72.png",
+      "sizes": "72x72",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/quantedge-pro/icons/icon-96.png",
+      "sizes": "96x96",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/quantedge-pro/icons/icon-128.png",
+      "sizes": "128x128",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/quantedge-pro/icons/icon-144.png",
+      "sizes": "144x144",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/quantedge-pro/icons/icon-152.png",
+      "sizes": "152x152",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/quantedge-pro/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/quantedge-pro/icons/icon-384.png",
+      "sizes": "384x384",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/quantedge-pro/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Open Terminal",
+      "short_name": "Terminal",
+      "description": "Live trading terminal",
+      "url": "/quantedge-pro/",
+      "icons": [{ "src": "/quantedge-pro/icons/icon-96.png", "sizes": "96x96" }]
+    },
+    {
+      "name": "Trade Journal",
+      "short_name": "Journal",
+      "description": "Signal log and trade journal",
+      "url": "/quantedge-pro/journal.html",
+      "icons": [{ "src": "/quantedge-pro/icons/icon-96.png", "sizes": "96x96" }]
+    }
+  ],
+  "screenshots": [],
+  "related_applications": [],
+  "prefer_related_applications": false
+}

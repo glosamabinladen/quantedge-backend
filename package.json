@@ -1,0 +1,20 @@
+{
+  "name": "quantedge-pro-backend",
+  "version": "5.0.0",
+  "description": "QuantEdge Pro — Netlify serverless backend",
+  "scripts": {
+    "dev": "netlify dev",
+    "deploy": "netlify deploy --prod"
+  },
+  "dependencies": {
+    "@netlify/functions": "^2.0.0",
+    "web-push": "^3.6.7",
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "netlify-cli": "^17.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
