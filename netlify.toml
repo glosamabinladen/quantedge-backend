@@ -6,6 +6,15 @@
 [build.environment]
   NODE_VERSION = "18"
   NETLIFY_NEXT_PLUGIN_SKIP = "true"
+  NEXT_PRIVATE_SKIP_PLUGIN = "true"
+
+[build.processing]
+  skip_processing = true
+
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
+  [plugins.inputs]
+    enabled = false
 
 [[scheduledFunctions]]
   function = "morning-briefing"
