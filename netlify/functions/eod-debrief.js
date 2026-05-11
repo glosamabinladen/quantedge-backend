@@ -94,7 +94,7 @@ export const handler = async () => {
 ACCOUNT:
 Portfolio Value: $${Number(account.portfolio_value || 0).toLocaleString()}
 Cash: $${Number(account.cash || 0).toLocaleString()}
-Day P&L: $${Number(account.equity || 0) - Number(account.last_equity || 0) > 0 ? "+" : ""}${(Number(account.equity || 0) - Number(account.last_equity || 0)).toFixed(2)}
+Day P&L: ${Number(account.equity || 0) - Number(account.last_equity || 0) >= 0 ? "+" : ""}${(Number(account.equity || 0) - Number(account.last_equity || 0)).toFixed(2)}
 
 TODAY'S ORDERS:
 ${orderSummary}
