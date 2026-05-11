@@ -1,7 +1,13 @@
 {
-  "name": "quantedge-pro-backend",
-  "version": "5.0.0",
+  "name": "quantedge-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "engines": {
+    "node": "18"
+  },
   "dependencies": {
+    "@netlify/blobs": "^8.1.0",
+    "@netlify/functions": "^2.6.0",
     "web-push": "^3.6.7"
   }
 }
