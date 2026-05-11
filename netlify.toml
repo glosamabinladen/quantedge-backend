@@ -17,6 +17,9 @@
 [functions."eod-debrief"]
   schedule = "0 21 * * 1-5"
 
+[functions."market-scanner"]
+  schedule = "30 13,14,15,16,17,18,19 * * 1-5"
+
 [[redirects]]
   from   = "/api/:function"
   to     = "/.netlify/functions/:function"
