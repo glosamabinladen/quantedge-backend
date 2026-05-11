@@ -11,22 +11,21 @@
 [build.processing]
   skip_processing = true
 
-[[plugins]]
-  package = "@netlify/plugin-nextjs"
-  [plugins.inputs]
-    enabled = false
+[functions."morning-briefing"]
+  schedule = "0 14 * * 1-5"
 
-[[scheduledFunctions]]
-  function = "morning-briefing"
-  cron = "0 14 * * 1-5"
+[functions."eod-debrief"]
+  schedule = "0 21 * * 1-5"
 
-[[scheduledFunctions]]
-  function = "eod-debrief"
-  cron = "0 21 * * 1-5"
+[[redirects]]
+  from   = "/api/:function"
+  to     = "/.netlify/functions/:function"
+  status = 200
+  force  = true
 
 [[headers]]
-  for = "/*"
+  for = "/.netlify/functions/*"
   [headers.values]
-    Access-Control-Allow-Origin = "https://glosamabinladen.github.io"
+    Access-Control-Allow-Origin  = "https://glosamabinladen.github.io"
     Access-Control-Allow-Methods = "GET, POST, OPTIONS"
     Access-Control-Allow-Headers = "Content-Type"
