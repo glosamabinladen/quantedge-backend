@@ -1,7 +1,5 @@
 // netlify/functions/log-signal.js
 // Auto-logs AI signals from the terminal into persistent storage
-// Journal.html reads from this store to display signal history
-
 import { getStore } from "@netlify/blobs";
 
 export const handler = async (event) => {
@@ -45,7 +43,6 @@ export const handler = async (event) => {
       const store = getStore("signal-log");
       await store.setJSON(signal.id, signal);
 
-      // Also update daily summary
       const dateKey = `daily-${signal.date.replace(/\//g, "-")}`;
       let daily;
       try {
@@ -65,36 +62,26 @@ export const handler = async (event) => {
   }
 
   if (event.httpMethod === "GET") {
-    // Retrieve signals — supports ?date=MM-DD-YYYY or ?limit=N or ?all=true
-    const { date, limit, all } = event.queryStringParameters || {};
-
+    const { date, limit } = event.queryStringParameters || {};
     try {
       const store = getStore("signal-log");
 
       if (date) {
-        // Get signals for a specific date
         const dateKey = `daily-${date}`;
         let daily;
-        try {
-          daily = await store.getJSON(dateKey);
-        } catch {
-          return corsResponse(200, { signals: [], date, count: 0 });
-        }
+        try { daily = await store.getJSON(dateKey); } catch { return corsResponse(200, { signals: [], date, count: 0 }); }
         if (!daily) return corsResponse(200, { signals: [], date, count: 0 });
-
         const signals = await Promise.all(
           (daily.signals || []).map(async (id) => {
             try { return await store.getJSON(id); } catch { return null; }
           })
         );
-        return corsResponse(200, { 
-          signals: signals.filter(Boolean).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)), 
-          date, 
-          count: signals.filter(Boolean).length 
+        return corsResponse(200, {
+          signals: signals.filter(Boolean).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)),
+          date, count: signals.filter(Boolean).length
         });
       }
 
-      // Get recent signals
       const { blobs } = await store.list();
       const signalBlobs = blobs.filter(b => !b.key.startsWith("daily-"));
       const recent = signalBlobs
@@ -107,7 +94,7 @@ export const handler = async (event) => {
         })
       );
 
-      return corsResponse(200, { 
+      return corsResponse(200, {
         signals: signals.filter(Boolean).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)),
         count: signals.filter(Boolean).length
       });
@@ -124,7 +111,7 @@ function corsResponse(statusCode, body) {
     statusCode,
     headers: {
       "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "https://glosamabinladen.github.io",
+      "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type",
     },
