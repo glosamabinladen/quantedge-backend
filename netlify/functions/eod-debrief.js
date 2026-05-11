@@ -1,110 +1,80 @@
 // netlify/functions/eod-debrief.js
 // SCHEDULED: 4:00 PM EST (21:00 UTC) — Monday through Friday
-// Pulls today's signals from log, generates EOD debrief via Claude, pushes to devices
+// Pulls EOD portfolio data, grades the day, stores in Blobs, pushes notification
 
 import { getStore } from "@netlify/blobs";
 import webpush from "web-push";
 
 export const handler = async () => {
-  const POLYGON_KEY = process.env.POLYGON_API_KEY;
-  const ALPACA_KEY = process.env.ALPACA_API_KEY;
-  const ALPACA_SECRET = process.env.ALPACA_SECRET_KEY;
-  const CLAUDE_KEY = process.env.ANTHROPIC_API_KEY;
-  const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY;
+  const ALPACA_KEY    = process.env.ALPACA_API_KEY;
+  const ALPACA_SEC    = process.env.ALPACA_API_SECRET;
+  const CLAUDE_KEY    = process.env.ANTHROPIC_API_KEY;
+  const VAPID_PUBLIC  = process.env.VAPID_PUBLIC_KEY;
   const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY;
+
+  if (!ALPACA_KEY || !CLAUDE_KEY) {
+    console.error("Missing API keys");
+    return { statusCode: 500, body: "Missing API keys" };
+  }
 
   console.log("🌆 QuantEdge EOD Debrief starting...");
 
-  const today = new Date().toLocaleDateString("en-US", { timeZone: "America/New_York" }).replace(/\//g, "-");
+  const alpacaHeaders = {
+    "APCA-API-KEY-ID":     ALPACA_KEY,
+    "APCA-API-SECRET-KEY": ALPACA_SEC,
+    "Content-Type":        "application/json",
+  };
 
-  // 1. Pull today's signals from signal-log store
-  let todaySignals = [];
+  // 1. Pull account snapshot
+  let account = {};
   try {
-    const signalStore = getStore("signal-log");
-    const dateKey = `daily-${today}`;
-    let daily;
-    try {
-      daily = await signalStore.getJSON(dateKey);
-    } catch {
-      daily = null;
-    }
-    
-    if (daily?.signals?.length) {
-      const fetched = await Promise.all(
-        daily.signals.map(async (id) => {
-          try { return await signalStore.getJSON(id); } catch { return null; }
-        })
-      );
-      todaySignals = fetched.filter(Boolean);
-    }
+    const r = await fetch("https://paper-api.alpaca.markets/v2/account", { headers: alpacaHeaders });
+    account = await r.json();
+    console.log(`Portfolio value: $${account.portfolio_value}`);
   } catch (err) {
-    console.error("Signal fetch failed:", err.message);
+    console.error("Alpaca account fetch failed:", err.message);
   }
 
-  // 2. Pull Alpaca portfolio performance
-  let portfolioData = { equity: 0, pnl: 0, pnlPercent: 0 };
-  if (ALPACA_KEY && ALPACA_SECRET) {
-    try {
-      const [accountRes, historyRes] = await Promise.all([
-        fetch("https://paper-api.alpaca.markets/v2/account", {
-          headers: {
-            "APCA-API-KEY-ID": ALPACA_KEY,
-            "APCA-API-SECRET-KEY": ALPACA_SECRET,
-          },
-        }),
-        fetch("https://paper-api.alpaca.markets/v2/portfolio/history?period=1D&timeframe=1H", {
-          headers: {
-            "APCA-API-KEY-ID": ALPACA_KEY,
-            "APCA-API-SECRET-KEY": ALPACA_SECRET,
-          },
-        }),
-      ]);
-
-      const account = await accountRes.json();
-      const history = await historyRes.json();
-
-      portfolioData.equity = parseFloat(account.equity) || 0;
-      portfolioData.cash = parseFloat(account.cash) || 0;
-      
-      if (history.profit_loss_pct) {
-        const pcts = history.profit_loss_pct;
-        portfolioData.pnlPercent = (pcts[pcts.length - 1] * 100).toFixed(2);
-      }
-      if (history.profit_loss) {
-        const pnls = history.profit_loss;
-        portfolioData.pnl = pnls[pnls.length - 1]?.toFixed(2) || 0;
-      }
-    } catch (err) {
-      console.error("Alpaca fetch failed:", err.message);
-    }
-  }
-
-  // 3. Pull SPY EOD data for context
-  let spyEOD = null;
-  if (POLYGON_KEY) {
-    try {
-      const todayFormatted = new Date().toISOString().split("T")[0];
-      const res = await fetch(
-        `https://api.polygon.io/v1/open-close/SPY/${todayFormatted}?adjusted=true&apiKey=${POLYGON_KEY}`
-      );
-      spyEOD = await res.json();
-    } catch (err) {
-      console.log("SPY EOD data unavailable");
-    }
-  }
-
-  // 4. Generate EOD debrief via Claude
-  let debrief = { grade: "B", summary: "", lessons: [], tomorrowSetups: [], psychNote: "" };
+  // 2. Pull today's orders
+  let orders = [];
   try {
-    const signalSummary = todaySignals.length
-      ? todaySignals.map(s => 
-          `${s.ticker} ${s.action} @ $${s.price} | Confidence: ${s.confidence}% | Setup: ${s.setupType}`
-        ).join("\n")
-      : "No signals logged today";
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const r = await fetch(
+      `https://paper-api.alpaca.markets/v2/orders?status=all&limit=50&after=${today.toISOString()}`,
+      { headers: alpacaHeaders }
+    );
+    orders = await r.json();
+  } catch (err) {
+    console.error("Alpaca orders fetch failed:", err.message);
+  }
 
-    const spyNote = spyEOD?.close
-      ? `SPY: Open $${spyEOD.open} → Close $${spyEOD.close} (${((spyEOD.close - spyEOD.open) / spyEOD.open * 100).toFixed(2)}%)`
-      : "SPY data unavailable";
+  // 3. Pull open positions
+  let positions = [];
+  try {
+    const r = await fetch("https://paper-api.alpaca.markets/v2/positions", { headers: alpacaHeaders });
+    positions = await r.json();
+  } catch (err) {
+    console.error("Alpaca positions fetch failed:", err.message);
+  }
+
+  // 4. Generate Claude EOD debrief
+  let debrief = { grade: "N/A", summary: "", improvements: [], overnightRisk: "", tomorrowFocus: "" };
+
+  const orderSummary = orders.length
+    ? orders.map((o) => `${o.symbol} ${o.side.toUpperCase()} ${o.qty} @ $${o.filled_avg_price ?? "pending"} [${o.status}]`).join("\n")
+    : "No orders today";
+
+  const positionSummary = positions.length
+    ? positions.map((p) =>
+        `${p.symbol}: ${p.qty} shares, P&L $${Number(p.unrealized_pl).toFixed(2)} (${(p.unrealized_plpc * 100).toFixed(2)}%)`
+      ).join("\n")
+    : "No open positions";
+
+  try {
+    const today = new Date().toLocaleDateString("en-US", {
+      weekday: "long", month: "long", day: "numeric", timeZone: "America/New_York",
+    });
 
     const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -115,34 +85,33 @@ export const handler = async () => {
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 800,
-        system: "You are QuantEdge Pro's EOD performance coach. Review the day's trading activity and deliver a sharp, honest debrief to help the trader grow. Be direct and constructive.",
+        max_tokens: 600,
+        system: "You are QuantEdge Pro's EOD performance analyst. Be direct and honest — praise what worked, call out what didn't. The trader is paper trading and building real money skills. No disclaimers.",
         messages: [{
           role: "user",
-          content: `Generate an EOD trading debrief.
+          content: `Generate an end-of-day debrief for ${today}.
 
-TODAY'S SIGNALS:
-${signalSummary}
+ACCOUNT:
+Portfolio Value: $${Number(account.portfolio_value || 0).toLocaleString()}
+Cash: $${Number(account.cash || 0).toLocaleString()}
+Day P&L: $${Number(account.equity || 0) - Number(account.last_equity || 0) > 0 ? "+" : ""}${(Number(account.equity || 0) - Number(account.last_equity || 0)).toFixed(2)}
 
-MARKET PERFORMANCE:
-${spyNote}
+TODAY'S ORDERS:
+${orderSummary}
 
-PORTFOLIO:
-Equity: $${portfolioData.equity}
-Today P&L: $${portfolioData.pnl} (${portfolioData.pnlPercent}%)
+OPEN POSITIONS:
+${positionSummary}
 
-Respond ONLY with this JSON:
+Respond ONLY with this JSON (no extra text):
 {
-  "grade": "A+" or "A" or "B+" or "B" or "C" or "D" or "N/A",
-  "summary": "<2-3 sentence honest day assessment>",
-  "lessons": ["<lesson 1>", "<lesson 2>"],
-  "tomorrowSetups": [
-    {"ticker": "SYMBOL", "watchFor": "<what to look for tomorrow>", "direction": "LONG or SHORT"}
-  ],
-  "psychNote": "<1 sentence mental game coaching tip for tomorrow>",
-  "signalCount": ${todaySignals.length},
-  "dayType": "TRENDING" or "CHOPPY" or "LOW_VOLUME" or "HIGH_VOLATILITY" or "UNKNOWN"
-}`
+  "grade": "A" or "B" or "C" or "D" or "F",
+  "summary": "<2-3 sentence honest performance read>",
+  "wentWell": "<what worked today, 1 sentence>",
+  "improvements": ["<improvement 1>", "<improvement 2>"],
+  "overnightRisk": "<risk assessment for open positions, 1 sentence>",
+  "tomorrowFocus": "<single most important thing to focus on tomorrow>",
+  "dayPnl": "<formatted P&L string e.g. +$142.50>"
+}`,
         }],
       }),
     });
@@ -156,41 +125,40 @@ Respond ONLY with this JSON:
     }
   } catch (err) {
     console.error("Claude debrief failed:", err.message);
-    debrief.summary = `Day complete. ${todaySignals.length} signals logged. Check journal for review.`;
+    debrief.summary = "EOD data loaded. Review your trades in the journal.";
   }
 
-  // 5. Store EOD debrief
+  // 5. Store debrief in Netlify Blobs
   try {
     const store = getStore("daily-briefings");
+    const today = new Date().toLocaleDateString("en-US", { timeZone: "America/New_York" }).replace(/\//g, "-");
     await store.setJSON(`eod-${today}`, {
       type: "eod",
       date: today,
       generatedAt: new Date().toISOString(),
       debrief,
-      portfolioData,
-      signalCount: todaySignals.length,
-      spyEOD,
+      account: {
+        portfolioValue: account.portfolio_value,
+        cash: account.cash,
+        equity: account.equity,
+      },
+      ordersCount: orders.length,
+      positions: positionSummary,
     });
     console.log("✅ EOD debrief stored");
   } catch (err) {
-    console.error("Store failed:", err.message);
+    console.error("Blob store failed:", err.message);
   }
 
-  // 6. Send push notifications
+  // 6. Push notification to all devices
   if (VAPID_PUBLIC && VAPID_PRIVATE) {
-    webpush.setVapidDetails(
-      "mailto:quantedge@trading.app",
-      VAPID_PUBLIC,
-      VAPID_PRIVATE
-    );
+    webpush.setVapidDetails("mailto:quantedge@trading.app", VAPID_PUBLIC, VAPID_PRIVATE);
 
-    const gradeEmoji = { "A+": "🏆", "A": "🌟", "B+": "✅", "B": "👍", "C": "⚠️", "D": "🔴", "N/A": "📋" };
-    const emoji = gradeEmoji[debrief.grade] || "📊";
-    const pnlStr = portfolioData.pnl >= 0 ? `+$${portfolioData.pnl}` : `-$${Math.abs(portfolioData.pnl)}`;
+    const gradeEmoji = { A: "🏆", B: "✅", C: "⚠️", D: "📉", F: "🚨" }[debrief.grade] ?? "📊";
 
     const notification = {
-      title: `${emoji} EOD Debrief — Grade: ${debrief.grade}`,
-      body: `${debrief.summary || "Day complete."} P&L: ${pnlStr} | ${todaySignals.length} signals logged.`,
+      title: `${gradeEmoji} EOD Debrief — Grade: ${debrief.grade}`,
+      body: debrief.summary || "Market closed. Review your journal.",
       icon: "/icons/icon-192.png",
       badge: "/icons/badge-72.png",
       tag: "eod-debrief",
@@ -198,19 +166,17 @@ Respond ONLY with this JSON:
         url: "https://glosamabinladen.github.io/quantedge-pro/journal.html",
         type: "eod",
         grade: debrief.grade,
-        pnl: portfolioData.pnl,
         timestamp: new Date().toISOString(),
       },
       actions: [
         { action: "journal", title: "Open Journal" },
-        { action: "open", title: "Open Terminal" },
+        { action: "open",    title: "Open Terminal" },
       ],
     };
 
     try {
       const subStore = getStore("push-subscriptions");
       const { blobs } = await subStore.list();
-      
       let sent = 0;
       for (const { key } of blobs) {
         try {
@@ -222,6 +188,7 @@ Respond ONLY with this JSON:
         } catch (err) {
           if (err.statusCode === 410) {
             await subStore.delete(key);
+            console.log(`Removed expired subscription: ${key}`);
           }
         }
       }
@@ -229,10 +196,12 @@ Respond ONLY with this JSON:
     } catch (err) {
       console.error("Push batch failed:", err.message);
     }
+  } else {
+    console.log("⚠️ VAPID keys not set — skipping push notifications");
   }
 
   return {
     statusCode: 200,
-    body: JSON.stringify({ success: true, debrief, signalCount: todaySignals.length }),
+    body: JSON.stringify({ success: true, debrief, message: "EOD debrief complete" }),
   };
 };
