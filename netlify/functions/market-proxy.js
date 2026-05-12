@@ -1,6 +1,5 @@
 // netlify/functions/market-proxy.js
 // Secure proxy for Polygon.io — API key stays server-side
-// Called by: GitHub Pages frontend instead of hitting Polygon directly
 export const handler = async (event) => {
   if (event.httpMethod === "OPTIONS") {
     return corsResponse(200, {});
@@ -13,22 +12,31 @@ export const handler = async (event) => {
   if (!path) {
     return corsResponse(400, { error: "Missing 'path' query parameter" });
   }
+
+  // Strip any query string from path before whitelist check
+  const cleanPath = path.split("?")[0];
+
   const allowedPaths = [
     "/v2/aggs/ticker/",
     "/v2/last/trade/",
     "/v1/open-close/",
-    "/v2/snapshot/locale/us/markets/stocks/tickers",
-    "/v2/snapshot/locale/us/markets/stocks/tickers/",
+    "/v2/snapshot/locale/us/markets/stocks",
     "/v3/trades/",
     "/v2/aggs/grouped/locale/us/market/stocks/",
     "/vX/reference/tickers",
   ];
-  const isAllowed = allowedPaths.some((allowed) => path.startsWith(allowed));
+  const isAllowed = allowedPaths.some((allowed) => cleanPath.startsWith(allowed));
   if (!isAllowed) {
-    return corsResponse(403, { error: "Endpoint not permitted" });
+    return corsResponse(403, { error: "Endpoint not permitted", path: cleanPath });
   }
-  const queryString = params ? `&${params}` : "";
-  const url = `https://api.polygon.io${path}?apiKey=${POLYGON_KEY}${queryString}`;
+
+  // Build query string — merge params from path and params parameter
+  const pathParts = path.split("?");
+  const pathQueryString = pathParts[1] || "";
+  const extraParams = params || "";
+  const allParams = [pathQueryString, extraParams].filter(Boolean).join("&");
+  const url = `https://api.polygon.io${cleanPath}?apiKey=${POLYGON_KEY}${allParams ? "&" + allParams : ""}`;
+
   try {
     const response = await fetch(url);
     const data = await response.json();
@@ -37,6 +45,7 @@ export const handler = async (event) => {
     return corsResponse(502, { error: "Polygon.io request failed", detail: err.message });
   }
 };
+
 function corsResponse(statusCode, body) {
   return {
     statusCode,
