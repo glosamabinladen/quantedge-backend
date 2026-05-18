@@ -1,207 +1,208 @@
 // netlify/functions/morning-briefing.js
-// SCHEDULED: 9:00 AM EST (14:00 UTC) — Monday through Friday
-// Pulls pre-market data, generates Claude AI briefing, pushes to all devices
+// Scheduled: runs at 9AM EST on weekdays (14:00 UTC)
+// Generates AI market briefing and stores in Netlify Blobs
 
-import { getStore } from "@netlify/blobs";
-import webpush from "web-push";
+const https = require("https");
+const { getStore } = require("@netlify/blobs");
 
-const WATCHLIST = ["SPY", "NVDA", "TSLA", "AAPL", "MSFT", "META", "QQQ", "AMD"];
+// ── CONFIG ────────────────────────────────────────────────
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const POLYGON_API_KEY = process.env.POLYGON_API_KEY;
 
-export const handler = async () => {
-  const POLYGON_KEY = process.env.POLYGON_API_KEY;
-  const CLAUDE_KEY = process.env.ANTHROPIC_API_KEY;
-  const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY;
-  const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY;
+const WATCHLIST = ["AAPL","NVDA","TSLA","SPY","MSFT","META","AMD","COIN","PLTR","AMZN","GOOGL","NFLX","QQQ","SOFI","HOOD"];
 
-  if (!POLYGON_KEY || !CLAUDE_KEY) {
-    console.error("Missing API keys");
-    return { statusCode: 500, body: "Missing API keys" };
-  }
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Content-Type": "application/json",
+};
 
-  console.log("🌅 QuantEdge Morning Briefing starting...");
-
-  // 1. Fetch pre-market snapshot for watchlist
-  let marketData = {};
-  try {
-    const tickerList = WATCHLIST.join(",");
-    const snapRes = await fetch(
-      `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?tickers=${tickerList}&apiKey=${POLYGON_KEY}`
-    );
-    const snapData = await snapRes.json();
-    
-    if (snapData.tickers) {
-      snapData.tickers.forEach((t) => {
-        marketData[t.ticker] = {
-          price: t.day?.c || t.prevDay?.c || 0,
-          prevClose: t.prevDay?.c || 0,
-          changePercent: t.todaysChangePerc || 0,
-          volume: t.day?.v || 0,
-          high: t.day?.h || 0,
-          low: t.day?.l || 0,
-          vwap: t.day?.vw || 0,
-        };
+// ── HELPERS ───────────────────────────────────────────────
+function httpsGet(url) {
+  return new Promise((resolve) => {
+    https.get(url, { headers: { "User-Agent": "QuantEdge/1.0" } }, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => {
+        try { resolve(JSON.parse(data)); }
+        catch (_) { resolve({}); }
       });
-    }
-  } catch (err) {
-    console.error("Polygon fetch failed:", err.message);
-  }
+    }).on("error", () => resolve({}));
+  });
+}
 
-  // 2. Fetch yesterday's overall market performance
-  let yesterdayNote = "";
-  try {
-    const yesterday = new Date();
-    yesterday.setDate(yesterday.getDate() - 1);
-    // Skip weekends
-    while (yesterday.getDay() === 0 || yesterday.getDay() === 6) {
-      yesterday.setDate(yesterday.getDate() - 1);
-    }
-    const dateStr = yesterday.toISOString().split("T")[0];
-    const spyRes = await fetch(
-      `https://api.polygon.io/v1/open-close/SPY/${dateStr}?adjusted=true&apiKey=${POLYGON_KEY}`
-    );
-    const spyData = await spyRes.json();
-    if (spyData.close) {
-      const change = ((spyData.close - spyData.open) / spyData.open * 100).toFixed(2);
-      yesterdayNote = `Yesterday SPY: Open $${spyData.open}, Close $${spyData.close} (${change > 0 ? "+" : ""}${change}%)`;
-    }
-  } catch (err) {
-    console.log("Yesterday data unavailable");
-  }
-
-  // 3. Generate AI Morning Briefing via Claude
-  let briefing = { summary: "", topPicks: [], risks: [], bias: "NEUTRAL" };
-  try {
-    const marketSummary = Object.entries(marketData)
-      .map(([t, d]) => `${t}: $${d.price?.toFixed(2)} (${d.changePercent >= 0 ? "+" : ""}${d.changePercent?.toFixed(2)}%)`)
-      .join(", ");
-
-    const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": CLAUDE_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 800,
-        system: "You are QuantEdge Pro's morning market analyst. Deliver sharp, actionable pre-market briefings for a retail trader doing paper trading. Be direct and money-focused. No disclaimers.",
-        messages: [{
-          role: "user",
-          content: `Generate a morning briefing for today's trading session.
-
-PRE-MARKET DATA:
-${marketSummary}
-${yesterdayNote}
-
-Respond ONLY with this JSON (no extra text):
-{
-  "bias": "BULLISH" or "BEARISH" or "NEUTRAL",
-  "summary": "<2-3 sentence overall market read for today>",
-  "topPicks": [
-    {"ticker": "SYMBOL", "direction": "LONG" or "SHORT", "reason": "<1 sentence why>", "keyLevel": <price>},
-    {"ticker": "SYMBOL", "direction": "LONG" or "SHORT", "reason": "<1 sentence why>", "keyLevel": <price>}
-  ],
-  "risks": ["<risk 1>", "<risk 2>"],
-  "focusTime": "<best time window to trade today e.g. 9:45-10:30 AM EST>",
-  "mantra": "<one sharp trading mantra for the day>"
-}`
-        }],
-      }),
+function httpsPost(options, body) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => {
+        try { resolve(JSON.parse(data)); }
+        catch (_) { resolve({}); }
+      });
     });
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
 
-    const claudeData = await claudeRes.json();
-    const text = claudeData.content?.[0]?.text || "{}";
-    try {
-      briefing = JSON.parse(text.match(/\{[\s\S]*\}/)?.[0] || "{}");
-    } catch {
-      briefing.summary = text;
-    }
-  } catch (err) {
-    console.error("Claude briefing failed:", err.message);
-    briefing.summary = "Market data loaded. Check terminal for pre-market conditions.";
-  }
+// ── FETCH MARKET SNAPSHOT ─────────────────────────────────
+async function getMarketData() {
+  if (!POLYGON_API_KEY) return {};
 
-  // 4. Store briefing in Netlify Blobs
-  try {
-    const store = getStore("daily-briefings");
-    const today = new Date().toLocaleDateString("en-US", { timeZone: "America/New_York" }).replace(/\//g, "-");
-    await store.setJSON(`morning-${today}`, {
-      type: "morning",
-      date: today,
-      generatedAt: new Date().toISOString(),
-      briefing,
-      marketData,
+  const tickerList = WATCHLIST.join(",");
+  const snap = await httpsGet(
+    `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?tickers=${tickerList}&apiKey=${POLYGON_API_KEY}`
+  );
+
+  const data = {};
+  if (snap.tickers) {
+    snap.tickers.forEach((t) => {
+      const day = t.day || {};
+      const prevDay = t.prevDay || {};
+      const price = (t.lastTrade && t.lastTrade.p) || day.c || prevDay.c || 0;
+      const prev = prevDay.c || 0;
+      data[t.ticker] = {
+        price: price.toFixed(2),
+        chg: prev > 0 ? (((price - prev) / prev) * 100).toFixed(2) : "0.00",
+        vol: day.v || 0,
+        high: (day.h || price).toFixed(2),
+        low: (day.l || price).toFixed(2),
+      };
     });
-    console.log("✅ Morning briefing stored");
-  } catch (err) {
-    console.error("Store failed:", err.message);
   }
+  return data;
+}
 
-  // 5. Send push notifications to all subscribed devices
-  if (VAPID_PUBLIC && VAPID_PRIVATE) {
-    webpush.setVapidDetails(
-      "mailto:quantedge@trading.app",
-      VAPID_PUBLIC,
-      VAPID_PRIVATE
-    );
-
-    const biasEmoji = briefing.bias === "BULLISH" ? "📈" : briefing.bias === "BEARISH" ? "📉" : "➡️";
-    const topPick = briefing.topPicks?.[0];
-    
-    const notification = {
-      title: `${biasEmoji} QuantEdge Morning Briefing`,
-      body: briefing.summary || "Market open in 30 minutes. Check your terminal.",
-      icon: "/icons/icon-192.png",
-      badge: "/icons/badge-72.png",
-      tag: "morning-briefing",
-      data: {
-        url: "https://glosamabinladen.github.io/quantedge-pro",
-        type: "morning",
-        bias: briefing.bias,
-        topPick: topPick?.ticker,
-        timestamp: new Date().toISOString(),
-      },
-      actions: [
-        { action: "open", title: "Open Terminal" },
-        { action: "journal", title: "Open Journal" },
-      ],
+// ── GENERATE BRIEFING VIA CLAUDE ──────────────────────────
+async function generateBriefing(marketData) {
+  if (!ANTHROPIC_API_KEY) {
+    return {
+      bias: "NEUTRAL",
+      summary: "API key not configured — briefing unavailable.",
+      topPicks: [],
+      avoid: [],
+      mantra: "No edge found, no trade placed.",
     };
-
-    try {
-      const subStore = getStore("push-subscriptions");
-      const { blobs } = await subStore.list();
-      
-      let sent = 0;
-      for (const { key } of blobs) {
-        try {
-          const sub = await subStore.getJSON(key);
-          if (sub?.subscription) {
-            await webpush.sendNotification(sub.subscription, JSON.stringify(notification));
-            sent++;
-          }
-        } catch (err) {
-          // Subscription expired — remove it
-          if (err.statusCode === 410) {
-            await subStore.delete(key);
-            console.log(`Removed expired subscription: ${key}`);
-          }
-        }
-      }
-      console.log(`✅ Push notifications sent to ${sent} device(s)`);
-    } catch (err) {
-      console.error("Push notification batch failed:", err.message);
-    }
-  } else {
-    console.log("⚠️ VAPID keys not set — skipping push notifications");
   }
 
-  return {
-    statusCode: 200,
-    body: JSON.stringify({ 
-      success: true, 
-      briefing,
-      message: "Morning briefing complete" 
-    }),
+  const marketSummary = Object.entries(marketData)
+    .map(([sym, d]) => `${sym}: $${d.price} (${d.chg > 0 ? "+" : ""}${d.chg}%) Vol:${(d.vol/1e6).toFixed(1)}M`)
+    .join("\n");
+
+  const prompt = `You are QuantEdge Pro's market analyst. It is 9AM EST market open.
+
+Current pre-market / early data:
+${marketSummary || "No market data available yet."}
+
+Generate a concise morning briefing in this EXACT JSON format (no markdown, no explanation, raw JSON only):
+{
+  "bias": "BULLISH" | "BEARISH" | "NEUTRAL" | "VOLATILE",
+  "summary": "2-3 sentence market overview covering macro context, sector strength/weakness, and key risks today",
+  "topPicks": [
+    {"ticker": "SYM", "direction": "LONG" | "SHORT", "reason": "one sentence reason", "keyLevel": "$XXX"},
+    {"ticker": "SYM", "direction": "LONG" | "SHORT", "reason": "one sentence reason", "keyLevel": "$XXX"},
+    {"ticker": "SYM", "direction": "LONG" | "SHORT", "reason": "one sentence reason", "keyLevel": "$XXX"}
+  ],
+  "avoid": [
+    {"ticker": "SYM", "reason": "one sentence why to avoid today"}
+  ],
+  "sectorFocus": "Tech | Energy | Financials | Healthcare | Consumer | Crypto | Broad Market",
+  "riskLevel": "LOW" | "MEDIUM" | "HIGH" | "EXTREME",
+  "mantra": "one punchy trading mantra for today (max 10 words)"
+}`;
+
+  const body = JSON.stringify({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 1000,
+    messages: [{ role: "user", content: prompt }],
+  });
+
+  const options = {
+    hostname: "api.anthropic.com",
+    path: "/v1/messages",
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "Content-Length": Buffer.byteLength(body),
+    },
   };
+
+  try {
+    const response = await httpsPost(options, body);
+    const text = response.content?.[0]?.text || "{}";
+    // Strip any markdown fences
+    const clean = text.replace(/```json\n?|\n?```/g, "").trim();
+    return JSON.parse(clean);
+  } catch (e) {
+    console.error("Claude briefing parse error:", e.message);
+    return {
+      bias: "NEUTRAL",
+      summary: "Briefing generation failed — trade with caution.",
+      topPicks: [],
+      avoid: [],
+      mantra: "When in doubt, stay out.",
+    };
+  }
+}
+
+// ── STORE BRIEFING ────────────────────────────────────────
+async function storeBriefing(briefing, context) {
+  try {
+    const siteID =
+      (context && context.site && context.site.id) ||
+      process.env.NETLIFY_SITE_ID ||
+      "extraordinary-mandazi-a05e7e";
+    const token = process.env.NETLIFY_TOKEN;
+    const storeConfig = token
+      ? { name: "briefings", siteID, token }
+      : { name: "briefings", siteID };
+
+    const store = getStore(storeConfig);
+    const payload = JSON.stringify({
+      briefing,
+      generatedAt: new Date().toISOString(),
+      date: new Date().toLocaleDateString("en-US", { timeZone: "America/New_York" }),
+    });
+    await store.set("morning-briefing", payload);
+    console.log("Morning briefing stored ✓");
+  } catch (e) {
+    console.error("Failed to store briefing:", e.message);
+  }
+}
+
+// ── HANDLER ───────────────────────────────────────────────
+exports.handler = async function (event, context) {
+  if (event.httpMethod === "OPTIONS") {
+    return { statusCode: 200, headers: CORS, body: "ok" };
+  }
+
+  console.log("Morning briefing triggered at", new Date().toISOString());
+
+  try {
+    const marketData = await getMarketData();
+    const briefing = await generateBriefing(marketData);
+    await storeBriefing(briefing, context);
+
+    return {
+      statusCode: 200,
+      headers: CORS,
+      body: JSON.stringify({
+        success: true,
+        briefing,
+        generatedAt: new Date().toISOString(),
+      }),
+    };
+  } catch (err) {
+    console.error("morning-briefing fatal:", err.message);
+    return {
+      statusCode: 200,
+      headers: CORS,
+      body: JSON.stringify({ success: false, error: err.message }),
+    };
+  }
 };
