@@ -1,15 +1,15 @@
 // netlify/functions/morning-briefing.js
-// Scheduled: runs at 9AM EST on weekdays (14:00 UTC)
-// Generates AI market briefing and stores in Netlify Blobs
+// Scheduled: 9AM EST weekdays (14:00 UTC) via netlify.toml
+// Also HTTP-callable for manual trigger
 
 const https = require("https");
 const { getStore } = require("@netlify/blobs");
 
-// ── CONFIG ────────────────────────────────────────────────
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const POLYGON_API_KEY = process.env.POLYGON_API_KEY;
+const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 
-const WATCHLIST = ["AAPL","NVDA","TSLA","SPY","MSFT","META","AMD","COIN","PLTR","AMZN","GOOGL","NFLX","QQQ","SOFI","HOOD"];
+const WATCHLIST = ["AAPL","NVDA","TSLA","SPY","MSFT","META","AMD","COIN","PLTR","AMZN"];
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -18,7 +18,7 @@ const CORS = {
   "Content-Type": "application/json",
 };
 
-// ── HELPERS ───────────────────────────────────────────────
+// ── HTTP HELPERS ──────────────────────────────────────────
 function httpsGet(url) {
   return new Promise((resolve) => {
     https.get(url, { headers: { "User-Agent": "QuantEdge/1.0" } }, (res) => {
@@ -48,70 +48,109 @@ function httpsPost(options, body) {
   });
 }
 
-// ── FETCH MARKET SNAPSHOT ─────────────────────────────────
-async function getMarketData() {
-  if (!POLYGON_API_KEY) return {};
-
-  const tickerList = WATCHLIST.join(",");
-  const snap = await httpsGet(
-    `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?tickers=${tickerList}&apiKey=${POLYGON_API_KEY}`
-  );
-
-  const data = {};
-  if (snap.tickers) {
-    snap.tickers.forEach((t) => {
-      const day = t.day || {};
-      const prevDay = t.prevDay || {};
-      const price = (t.lastTrade && t.lastTrade.p) || day.c || prevDay.c || 0;
-      const prev = prevDay.c || 0;
-      data[t.ticker] = {
-        price: price.toFixed(2),
-        chg: prev > 0 ? (((price - prev) / prev) * 100).toFixed(2) : "0.00",
-        vol: day.v || 0,
-        high: (day.h || price).toFixed(2),
-        low: (day.l || price).toFixed(2),
-      };
-    });
+// ── ROBUST JSON EXTRACTOR ─────────────────────────────────
+function extractJSON(text) {
+  if (!text) return null;
+  // Try direct parse first
+  try { return JSON.parse(text); } catch (_) {}
+  // Strip markdown fences
+  let clean = text.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
+  try { return JSON.parse(clean); } catch (_) {}
+  // Find first { ... } block
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start !== -1 && end !== -1 && end > start) {
+    try { return JSON.parse(text.slice(start, end + 1)); } catch (_) {}
   }
+  return null;
+}
+
+// ── MARKET DATA ───────────────────────────────────────────
+async function getMarketData() {
+  const data = {};
+
+  // Try Finnhub first (higher rate limit)
+  if (FINNHUB_API_KEY) {
+    await Promise.all(WATCHLIST.map(async (sym) => {
+      try {
+        const r = await httpsGet(`https://finnhub.io/api/v1/quote?symbol=${sym}&token=${FINNHUB_API_KEY}`);
+        if (r.c > 0) {
+          data[sym] = {
+            price: r.c.toFixed(2),
+            chg: r.pc > 0 ? (((r.c - r.pc) / r.pc) * 100).toFixed(2) : "0.00",
+            high: (r.h || r.c).toFixed(2),
+            low: (r.l || r.c).toFixed(2),
+          };
+        }
+      } catch (_) {}
+    }));
+  }
+
+  // Polygon fallback for any missing
+  if (POLYGON_API_KEY && Object.keys(data).length < WATCHLIST.length) {
+    const missing = WATCHLIST.filter(s => !data[s]).join(",");
+    if (missing) {
+      const snap = await httpsGet(
+        `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?tickers=${missing}&apiKey=${POLYGON_API_KEY}`
+      );
+      if (snap.tickers) {
+        snap.tickers.forEach((t) => {
+          const day = t.day || {};
+          const prev = t.prevDay || {};
+          const price = (t.lastTrade && t.lastTrade.p) || day.c || prev.c || 0;
+          if (price > 0) {
+            data[t.ticker] = {
+              price: price.toFixed(2),
+              chg: prev.c > 0 ? (((price - prev.c) / prev.c) * 100).toFixed(2) : "0.00",
+              high: (day.h || price).toFixed(2),
+              low: (day.l || price).toFixed(2),
+            };
+          }
+        });
+      }
+    }
+  }
+
   return data;
 }
 
-// ── GENERATE BRIEFING VIA CLAUDE ──────────────────────────
+// ── GENERATE BRIEFING ─────────────────────────────────────
 async function generateBriefing(marketData) {
   if (!ANTHROPIC_API_KEY) {
     return {
       bias: "NEUTRAL",
-      summary: "API key not configured — briefing unavailable.",
-      topPicks: [],
-      avoid: [],
-      mantra: "No edge found, no trade placed.",
+      summary: "ANTHROPIC_API_KEY not set.",
+      topPicks: [], avoid: [],
+      sectorFocus: "Broad Market",
+      riskLevel: "MEDIUM",
+      mantra: "No key, no edge.",
     };
   }
 
-  const marketSummary = Object.entries(marketData)
-    .map(([sym, d]) => `${sym}: $${d.price} (${d.chg > 0 ? "+" : ""}${d.chg}%) Vol:${(d.vol/1e6).toFixed(1)}M`)
+  const lines = Object.entries(marketData)
+    .map(([sym, d]) => `${sym}: $${d.price} (${parseFloat(d.chg) >= 0 ? "+" : ""}${d.chg}%) H:${d.high} L:${d.low}`)
     .join("\n");
 
-  const prompt = `You are QuantEdge Pro's market analyst. It is 9AM EST market open.
+  const prompt = `You are QuantEdge Pro's AI market analyst. Generate a morning briefing for today's trading session.
 
-Current pre-market / early data:
-${marketSummary || "No market data available yet."}
+Early market data:
+${lines || "Market data unavailable — use general market knowledge."}
 
-Generate a concise morning briefing in this EXACT JSON format (no markdown, no explanation, raw JSON only):
+Respond with ONLY a valid JSON object. No markdown, no explanation, no text before or after. Raw JSON only:
 {
-  "bias": "BULLISH" | "BEARISH" | "NEUTRAL" | "VOLATILE",
-  "summary": "2-3 sentence market overview covering macro context, sector strength/weakness, and key risks today",
+  "bias": "BULLISH",
+  "summary": "2-3 sentence overview of market conditions and key themes",
   "topPicks": [
-    {"ticker": "SYM", "direction": "LONG" | "SHORT", "reason": "one sentence reason", "keyLevel": "$XXX"},
-    {"ticker": "SYM", "direction": "LONG" | "SHORT", "reason": "one sentence reason", "keyLevel": "$XXX"},
-    {"ticker": "SYM", "direction": "LONG" | "SHORT", "reason": "one sentence reason", "keyLevel": "$XXX"}
+    {"ticker": "AAPL", "direction": "LONG", "reason": "brief reason", "keyLevel": "$296"},
+    {"ticker": "COIN", "direction": "SHORT", "reason": "brief reason", "keyLevel": "$188"},
+    {"ticker": "NVDA", "direction": "LONG", "reason": "brief reason", "keyLevel": "$222"}
   ],
   "avoid": [
-    {"ticker": "SYM", "reason": "one sentence why to avoid today"}
+    {"ticker": "TSLA", "reason": "why to avoid today"}
   ],
-  "sectorFocus": "Tech | Energy | Financials | Healthcare | Consumer | Crypto | Broad Market",
-  "riskLevel": "LOW" | "MEDIUM" | "HIGH" | "EXTREME",
-  "mantra": "one punchy trading mantra for today (max 10 words)"
+  "sectorFocus": "Tech",
+  "riskLevel": "MEDIUM",
+  "mantra": "Cut losers fast, let winners run."
 }`;
 
   const body = JSON.stringify({
@@ -134,18 +173,31 @@ Generate a concise morning briefing in this EXACT JSON format (no markdown, no e
 
   try {
     const response = await httpsPost(options, body);
-    const text = response.content?.[0]?.text || "{}";
-    // Strip any markdown fences
-    const clean = text.replace(/```json\n?|\n?```/g, "").trim();
-    return JSON.parse(clean);
+    const rawText = response.content?.[0]?.text || "";
+    console.log("Claude raw response:", rawText.slice(0, 300));
+
+    const parsed = extractJSON(rawText);
+    if (!parsed || !parsed.bias) {
+      console.error("Failed to parse briefing JSON:", rawText.slice(0, 200));
+      return {
+        bias: "NEUTRAL",
+        summary: "Briefing parse failed — trade cautiously.",
+        topPicks: [], avoid: [],
+        sectorFocus: "Broad Market",
+        riskLevel: "HIGH",
+        mantra: "When in doubt, stay out.",
+      };
+    }
+    return parsed;
   } catch (e) {
-    console.error("Claude briefing parse error:", e.message);
+    console.error("Claude API error:", e.message);
     return {
       bias: "NEUTRAL",
-      summary: "Briefing generation failed — trade with caution.",
-      topPicks: [],
-      avoid: [],
-      mantra: "When in doubt, stay out.",
+      summary: "API error — trade cautiously.",
+      topPicks: [], avoid: [],
+      sectorFocus: "Broad Market",
+      riskLevel: "HIGH",
+      mantra: "No signal, no trade.",
     };
   }
 }
@@ -163,15 +215,16 @@ async function storeBriefing(briefing, context) {
       : { name: "briefings", siteID };
 
     const store = getStore(storeConfig);
-    const payload = JSON.stringify({
+    await store.set("morning-briefing", JSON.stringify({
       briefing,
       generatedAt: new Date().toISOString(),
       date: new Date().toLocaleDateString("en-US", { timeZone: "America/New_York" }),
-    });
-    await store.set("morning-briefing", payload);
-    console.log("Morning briefing stored ✓");
+    }));
+    console.log("Briefing stored ✓ bias:", briefing.bias);
+    return true;
   } catch (e) {
-    console.error("Failed to store briefing:", e.message);
+    console.error("Store error:", e.message);
+    return false;
   }
 }
 
@@ -181,18 +234,21 @@ exports.handler = async function (event, context) {
     return { statusCode: 200, headers: CORS, body: "ok" };
   }
 
-  console.log("Morning briefing triggered at", new Date().toISOString());
+  console.log("Morning briefing triggered:", new Date().toISOString());
 
   try {
     const marketData = await getMarketData();
+    console.log("Market data fetched for", Object.keys(marketData).length, "tickers");
+
     const briefing = await generateBriefing(marketData);
-    await storeBriefing(briefing, context);
+    const stored = await storeBriefing(briefing, context);
 
     return {
       statusCode: 200,
       headers: CORS,
       body: JSON.stringify({
         success: true,
+        stored,
         briefing,
         generatedAt: new Date().toISOString(),
       }),
