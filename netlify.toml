@@ -1,34 +1,14 @@
 [build]
-  publish = "public"
   functions = "netlify/functions"
-  command = "echo done"
 
-[build.environment]
-  NODE_VERSION = "18"
-  NETLIFY_NEXT_PLUGIN_SKIP = "true"
-  NEXT_PRIVATE_SKIP_PLUGIN = "true"
-
-[build.processing]
-  skip_processing = true
-
+# Morning briefing — 9:00 AM EST (14:00 UTC) weekdays
 [functions."morning-briefing"]
   schedule = "0 14 * * 1-5"
 
+# EOD debrief — 4:05 PM EST (21:05 UTC) weekdays (after market close)
 [functions."eod-debrief"]
-  schedule = "0 21 * * 1-5"
+  schedule = "5 21 * * 1-5"
 
+# Market scanner — every hour during market hours 9:30AM-4PM EST (14:30-21:00 UTC)
 [functions."market-scanner"]
-  schedule = "30 13,14,15,16,17,18,19 * * 1-5"
-
-[[redirects]]
-  from   = "/api/:function"
-  to     = "/.netlify/functions/:function"
-  status = 200
-  force  = true
-
-[[headers]]
-  for = "/.netlify/functions/*"
-  [headers.values]
-    Access-Control-Allow-Origin  = "*"
-    Access-Control-Allow-Methods = "GET, POST, DELETE, OPTIONS"
-    Access-Control-Allow-Headers = "Content-Type"
+  schedule = "30 14-21 * * 1-5"
