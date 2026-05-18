@@ -205,10 +205,7 @@ Respond with ONLY a valid JSON object. No markdown, no explanation, no text befo
 // ── STORE BRIEFING ────────────────────────────────────────
 async function storeBriefing(briefing, context) {
   try {
-    const siteID =
-      (context && context.site && context.site.id) ||
-      process.env.NETLIFY_SITE_ID ||
-      "extraordinary-mandazi-a05e7e";
+ const siteID = process.env.NETLIFY_SITE_ID || "extraordinary-mandazi-a05e7e";
     const token = process.env.NETLIFY_TOKEN;
     const storeConfig = token
       ? { name: "briefings", siteID, token }
