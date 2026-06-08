@@ -5,10 +5,10 @@
 [functions."morning-briefing"]
   schedule = "0 14 * * 1-5"
 
-# EOD debrief — 4:05 PM EST (21:05 UTC) weekdays (after market close)
+# EOD debrief — 4:05 PM EST (21:05 UTC) weekdays
 [functions."eod-debrief"]
   schedule = "5 21 * * 1-5"
 
-# Market scanner — every hour during market hours 9:30AM-4PM EST (14:30-21:00 UTC)
+# Market scanner — every 30 min during market hours 9:30AM-4PM EST
 [functions."market-scanner"]
-  schedule = "30 14-21 * * 1-5"
+  schedule = "0,30 14-20 * * 1-5"
