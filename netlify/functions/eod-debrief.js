@@ -3,6 +3,12 @@
 
 import { getStore } from "@netlify/blobs";
 
+const blob = (name) => getStore({
+  name,
+  siteID: process.env.NETLIFY_SITE_ID,
+  token:  process.env.NETLIFY_AUTH_TOKEN,
+});
+
 const ALPACA_KEY    = process.env.ALPACA_API_KEY;
 const ALPACA_SEC    = process.env.ALPACA_API_SECRET;
 const CLAUDE_KEY    = process.env.ANTHROPIC_API_KEY;
@@ -134,7 +140,7 @@ Respond ONLY with this JSON (no extra text):
 
   // 6. Store debrief in Blobs — SAME store as get-briefing reads ("briefings"), key "eod-debrief"
   try {
-    const store = getStore("briefings");
+    const store = blob("briefings");
     await store.setJSON("eod-debrief", {
       debrief,
       generatedAt: new Date().toISOString(),
