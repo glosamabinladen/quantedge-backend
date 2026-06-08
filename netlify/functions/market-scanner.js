@@ -4,6 +4,12 @@
 
 import { getStore } from "@netlify/blobs";
 
+const blob = (name) => getStore({
+  name,
+  siteID: process.env.NETLIFY_SITE_ID,
+  token:  process.env.NETLIFY_AUTH_TOKEN,
+});
+
 const POLYGON_KEY  = process.env.POLYGON_API_KEY;
 const ALPACA_KEY   = process.env.ALPACA_API_KEY;
 const ALPACA_SEC   = process.env.ALPACA_API_SECRET;
@@ -160,7 +166,7 @@ export const handler = async (event) => {
         console.log(`[scanner] STOP-LOSS closed ${pos.symbol} at ${unrealizedPct.toFixed(1)}%`);
 
         // Log the close to trade journal
-        const store = getStore("trade-journal");
+        const store = blob("trade-journal");
         const tradeKey = `close-${pos.symbol}-${Date.now()}`;
         await store.setJSON(tradeKey, {
           symbol:      pos.symbol,
@@ -259,7 +265,7 @@ Respond ONLY with this exact JSON:
     console.log(`[scanner] Claude: ${plannedTrades.length} trade(s). Bias: ${scanMeta.marketBias}`);
 
     // Store scan result
-    const scanStore = getStore("scan-results");
+    const scanStore = blob("scan-results");
     const scanKey = `scan-${now.toISOString().slice(0,16).replace(/[T:]/g, "-")}`;
     await scanStore.setJSON(scanKey, {
       timestamp: now.toISOString(),
@@ -346,11 +352,11 @@ Respond ONLY with this exact JSON:
         executedTrades.push(executed);
 
         // Log to trade journal
-        const journalStore = getStore("trade-journal");
+        const journalStore = blob("trade-journal");
         await journalStore.setJSON(`trade-${order.id}`, executed);
 
         // Also log as signal
-        const signalStore = getStore("signal-log");
+        const signalStore = blob("signal-log");
         await signalStore.setJSON(`sig-${order.id}`, {
           ...executed,
           action: trade.side.toUpperCase(),
