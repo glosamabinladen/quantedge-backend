@@ -1,6 +1,12 @@
 // netlify/functions/log-signal.js
 import { getStore } from "@netlify/blobs";
 
+const blob = (name) => getStore({
+  name,
+  siteID: process.env.NETLIFY_SITE_ID,
+  token:  process.env.NETLIFY_AUTH_TOKEN,
+});
+
 function corsResponse(statusCode, body) {
   return {
     statusCode,
@@ -47,7 +53,7 @@ export const handler = async (event) => {
     };
 
     try {
-      const store = getStore("signal-log");
+      const store = blob("signal-log");
       await store.setJSON(signal.id, signal);
       return corsResponse(200, { success: true, signalId: signal.id, signal });
     } catch (err) {
@@ -59,7 +65,7 @@ export const handler = async (event) => {
   if (event.httpMethod === "GET") {
     const { limit } = event.queryStringParameters || {};
     try {
-      const store = getStore("signal-log");
+      const store = blob("signal-log");
       const { blobs } = await store.list();
 
       const recent = blobs
