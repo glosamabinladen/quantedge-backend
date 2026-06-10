@@ -1,14 +1,16 @@
 [build]
   functions = "netlify/functions"
 
-# Morning briefing — 9:00 AM EST (14:00 UTC) weekdays
+# Morning briefing — 9:00 AM EDT (13:00 UTC) weekdays  [EDT=UTC-4, EST=UTC-5]
+# Oct–Mar use 14:00, Apr–Sep use 13:00 (currently EDT)
 [functions."morning-briefing"]
-  schedule = "0 14 * * 1-5"
+  schedule = "0 13 * * 1-5"
 
-# EOD debrief — 4:05 PM EST (21:05 UTC) weekdays
+# EOD debrief — 4:05 PM EDT (20:05 UTC) weekdays
 [functions."eod-debrief"]
-  schedule = "5 21 * * 1-5"
+  schedule = "5 20 * * 1-5"
 
-# Market scanner — every 30 min during market hours 9:30AM-4PM EST
+# Market scanner — every 30 min 9:00AM-4:30PM EDT (13:00-20:30 UTC)
+# Runs at :00 and :30 each hour; the function itself skips runs outside 9:30-4PM
 [functions."market-scanner"]
-  schedule = "0,30 14-20 * * 1-5"
+  schedule = "0,30 13-20 * * 1-5"
