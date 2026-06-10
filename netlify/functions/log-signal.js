@@ -15,6 +15,8 @@ function corsResponse(statusCode, body) {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods":"GET, POST, OPTIONS",
       "Access-Control-Allow-Headers":"Content-Type",
+      "Cache-Control":               "no-store, no-cache, must-revalidate",
+      "Netlify-CDN-Cache-Control":   "no-store",
     },
     body: JSON.stringify(body),
   };
