@@ -153,6 +153,21 @@ Respond with ONLY a valid JSON object. No markdown, no explanation, no text befo
       }
     );
 
+    // Surface raw API response so we can diagnose failures
+    if (response.type === "error" || response.error) {
+      const errMsg = response.error?.message || JSON.stringify(response);
+      console.error("Anthropic API error:", errMsg);
+      return {
+        bias: "NEUTRAL",
+        summary: `Anthropic API error: ${errMsg}`,
+        topPicks: [], avoid: [],
+        sectorFocus: "Broad Market",
+        riskLevel: "HIGH",
+        mantra: "No signal, no trade.",
+        _apiError: response,
+      };
+    }
+
     const rawText = response.content?.[0]?.text || "";
     console.log("Claude raw response:", rawText.slice(0, 300));
 
@@ -161,7 +176,7 @@ Respond with ONLY a valid JSON object. No markdown, no explanation, no text befo
       console.error("Failed to parse briefing JSON:", rawText.slice(0, 200));
       return {
         bias: "NEUTRAL",
-        summary: "Briefing generation failed — trade cautiously.",
+        summary: `Briefing parse failed. Raw: ${rawText.slice(0, 120)}`,
         topPicks: [], avoid: [],
         sectorFocus: "Broad Market",
         riskLevel: "HIGH",
@@ -173,7 +188,7 @@ Respond with ONLY a valid JSON object. No markdown, no explanation, no text befo
     console.error("Claude API error:", e.message);
     return {
       bias: "NEUTRAL",
-      summary: "API error — trade cautiously.",
+      summary: `Fetch error: ${e.message}`,
       topPicks: [], avoid: [],
       sectorFocus: "Broad Market",
       riskLevel: "HIGH",
@@ -198,6 +213,7 @@ export const handler = async (event) => {
     const generatedAt = new Date().toISOString();
 
     let stored = false;
+    let storeError = null;
     try {
       const store = blob("briefings");
       await store.set("morning-briefing", JSON.stringify({
@@ -209,12 +225,13 @@ export const handler = async (event) => {
       stored = true;
     } catch (e) {
       console.error("Store error:", e.message);
+      storeError = e.message;
     }
 
     return {
       statusCode: 200,
       headers: CORS,
-      body: JSON.stringify({ success: true, stored, briefing, generatedAt }),
+      body: JSON.stringify({ success: true, stored, storeError, briefing, generatedAt }),
     };
   } catch (err) {
     console.error("morning-briefing fatal:", err.message);
