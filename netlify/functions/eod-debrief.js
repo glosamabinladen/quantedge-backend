@@ -1,36 +1,41 @@
 // netlify/functions/eod-debrief.js
-// SCHEDULED: 4:05 PM EST (21:05 UTC) — Monday through Friday
+// SCHEDULED: 4:05 PM EDT weekdays (20:05 UTC) via netlify.toml
+// Pulls EOD portfolio data, grades the day, stores in Blobs, pushes notification
 
 import { getStore } from "@netlify/blobs";
+import webpush from "web-push";
 
+// ── BLOBS (explicit auth required) ───────────────────────────────────────────
 const blob = (name) => getStore({
   name,
   siteID: process.env.NETLIFY_SITE_ID,
   token:  process.env.NETLIFY_AUTH_TOKEN,
 });
 
-const ALPACA_KEY    = process.env.ALPACA_API_KEY;
-const ALPACA_SEC    = process.env.ALPACA_API_SECRET;
-const CLAUDE_KEY    = process.env.ANTHROPIC_API_KEY;
-
-const ALPACA_HEADERS = {
-  "APCA-API-KEY-ID":     ALPACA_KEY,
-  "APCA-API-SECRET-KEY": ALPACA_SEC,
-  "Content-Type":        "application/json",
-};
-
 export const handler = async () => {
+  const ALPACA_KEY    = process.env.ALPACA_API_KEY;
+  const ALPACA_SEC    = process.env.ALPACA_API_SECRET;
+  const CLAUDE_KEY    = process.env.ANTHROPIC_API_KEY;
+  const VAPID_PUBLIC  = process.env.VAPID_PUBLIC_KEY;
+  const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY;
+
   if (!ALPACA_KEY || !CLAUDE_KEY) {
     console.error("Missing API keys");
     return { statusCode: 500, body: "Missing API keys" };
   }
 
-  console.log("EOD Debrief starting:", new Date().toISOString());
+  console.log("QuantEdge EOD Debrief starting...");
+
+  const alpacaHeaders = {
+    "APCA-API-KEY-ID":     ALPACA_KEY,
+    "APCA-API-SECRET-KEY": ALPACA_SEC,
+    "Content-Type":        "application/json",
+  };
 
   // 1. Pull account snapshot
   let account = {};
   try {
-    const r = await fetch("https://paper-api.alpaca.markets/v2/account", { headers: ALPACA_HEADERS });
+    const r = await fetch("https://paper-api.alpaca.markets/v2/account", { headers: alpacaHeaders });
     account = await r.json();
     console.log(`Portfolio value: $${account.portfolio_value}`);
   } catch (err) {
@@ -44,10 +49,9 @@ export const handler = async () => {
     today.setHours(0, 0, 0, 0);
     const r = await fetch(
       `https://paper-api.alpaca.markets/v2/orders?status=all&limit=50&after=${today.toISOString()}`,
-      { headers: ALPACA_HEADERS }
+      { headers: alpacaHeaders }
     );
     orders = await r.json();
-    if (!Array.isArray(orders)) orders = [];
   } catch (err) {
     console.error("Alpaca orders fetch failed:", err.message);
   }
@@ -55,35 +59,31 @@ export const handler = async () => {
   // 3. Pull open positions
   let positions = [];
   try {
-    const r = await fetch("https://paper-api.alpaca.markets/v2/positions", { headers: ALPACA_HEADERS });
+    const r = await fetch("https://paper-api.alpaca.markets/v2/positions", { headers: alpacaHeaders });
     positions = await r.json();
-    if (!Array.isArray(positions)) positions = [];
   } catch (err) {
     console.error("Alpaca positions fetch failed:", err.message);
   }
 
-  // 4. Compute day P&L
-  const equity = parseFloat(account.equity || 0);
-  const lastEquity = parseFloat(account.last_equity || 0);
-  const dayPnl = equity - lastEquity;
+  // 4. Generate Claude EOD debrief
+  let debrief = { grade: "N/A", summary: "", improvements: [], overnightRisk: "", tomorrowFocus: "" };
 
   const orderSummary = orders.length
-    ? orders.map(o => `${o.symbol} ${o.side.toUpperCase()} ${o.qty}x @ $${o.filled_avg_price ?? "pending"} [${o.status}]`).join("\n")
-    : "No orders executed today";
+    ? orders.map((o) => `${o.symbol} ${o.side.toUpperCase()} ${o.qty} @ $${o.filled_avg_price ?? "pending"} [${o.status}]`).join("\n")
+    : "No orders today";
 
   const positionSummary = positions.length
-    ? positions.map(p => `${p.symbol}: ${p.qty} shares, unrealized P&L $${parseFloat(p.unrealized_pl).toFixed(2)} (${(parseFloat(p.unrealized_plpc) * 100).toFixed(2)}%)`).join("\n")
+    ? positions.map((p) =>
+        `${p.symbol}: ${p.qty} shares, P&L $${Number(p.unrealized_pl).toFixed(2)} (${(p.unrealized_plpc * 100).toFixed(2)}%)`
+      ).join("\n")
     : "No open positions";
-
-  // 5. Generate Claude EOD debrief
-  let debrief = { grade: "N/A", summary: "No data available.", improvements: [], overnightRisk: "Unknown", tomorrowFocus: "Review open positions" };
 
   try {
     const today = new Date().toLocaleDateString("en-US", {
       weekday: "long", month: "long", day: "numeric", timeZone: "America/New_York",
     });
 
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
+    const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type":      "application/json",
@@ -92,16 +92,16 @@ export const handler = async () => {
       },
       body: JSON.stringify({
         model:      "claude-sonnet-4-6",
-        max_tokens: 800,
-        system:     "You are QuantEdge Pro's EOD performance analyst. Be direct, specific, and honest — call out mistakes and praise good decisions. The trader is paper trading and building real skills. No disclaimers, no hedging.",
+        max_tokens: 600,
+        system: "You are QuantEdge Pro's EOD performance analyst. Be direct and honest — praise what worked, call out what didn't. The trader is paper trading and building real money skills. No disclaimers.",
         messages: [{
           role: "user",
-          content: `End-of-day debrief for ${today}.
+          content: `Generate an end-of-day debrief for ${today}.
 
-ACCOUNT SUMMARY:
-Portfolio Value: $${parseFloat(account.portfolio_value || 0).toLocaleString()}
-Cash Available: $${parseFloat(account.cash || 0).toLocaleString()}
-Day P&L: ${dayPnl >= 0 ? "+" : ""}$${dayPnl.toFixed(2)}
+ACCOUNT:
+Portfolio Value: $${Number(account.portfolio_value || 0).toLocaleString()}
+Cash: $${Number(account.cash || 0).toLocaleString()}
+Day P&L: ${Number(account.equity || 0) - Number(account.last_equity || 0) >= 0 ? "+" : ""}${(Number(account.equity || 0) - Number(account.last_equity || 0)).toFixed(2)}
 
 TODAY'S ORDERS:
 ${orderSummary}
@@ -109,57 +109,106 @@ ${orderSummary}
 OPEN POSITIONS:
 ${positionSummary}
 
-Grade this trading day and provide honest feedback. What went right, what went wrong, what to fix tomorrow.
-
 Respond ONLY with this JSON (no extra text):
 {
-  "grade": "A" | "B" | "C" | "D" | "F",
-  "dayPnl": "${dayPnl >= 0 ? "+" : ""}$${Math.abs(dayPnl).toFixed(2)}",
-  "summary": "2-3 sentence honest performance assessment with specific trade references",
-  "wentWell": "what worked today, be specific",
-  "improvements": ["specific improvement 1", "specific improvement 2"],
-  "bestTrade": "best trade today and why it worked, or N/A",
-  "worstTrade": "worst trade or mistake and what to learn, or N/A",
-  "overnightRisk": "risk assessment for open positions overnight",
-  "tomorrowFocus": "single most important thing to improve or focus on tomorrow"
+  "grade": "A" or "B" or "C" or "D" or "F",
+  "summary": "<2-3 sentence honest performance read>",
+  "wentWell": "<what worked today, 1 sentence>",
+  "improvements": ["<improvement 1>", "<improvement 2>"],
+  "overnightRisk": "<risk assessment for open positions, 1 sentence>",
+  "tomorrowFocus": "<single most important thing to focus on tomorrow>",
+  "dayPnl": "<formatted P&L string e.g. +$142.50>"
 }`,
         }],
       }),
     });
 
-    const data = await res.json();
-    const text = data.content?.[0]?.text || "{}";
-    const match = text.match(/\{[\s\S]*\}/);
-    if (match) {
-      try { debrief = JSON.parse(match[0]); } catch {}
+    const claudeData = await claudeRes.json();
+    const text = claudeData.content?.[0]?.text || "{}";
+    try {
+      debrief = JSON.parse(text.match(/\{[\s\S]*\}/)?.[0] || "{}");
+    } catch {
+      debrief.summary = text;
     }
-    console.log("EOD debrief grade:", debrief.grade);
   } catch (err) {
     console.error("Claude debrief failed:", err.message);
+    debrief.summary = "EOD data loaded. Review your trades in the journal.";
   }
 
-  // 6. Store debrief in Blobs — SAME store as get-briefing reads ("briefings"), key "eod-debrief"
+  // 5. Store debrief in Netlify Blobs
+  //    Store: "briefings" | Key: "eod-debrief"  ← matches what get-briefing.js reads
   try {
     const store = blob("briefings");
-    await store.setJSON("eod-debrief", {
-      debrief,
-      generatedAt: new Date().toISOString(),
+    await store.set("eod-debrief", JSON.stringify({
+      type: "eod",
       date: new Date().toLocaleDateString("en-US", { timeZone: "America/New_York" }),
+      generatedAt: new Date().toISOString(),
+      debrief,
       account: {
         portfolioValue: account.portfolio_value,
         cash:           account.cash,
         equity:         account.equity,
-        dayPnl:         dayPnl.toFixed(2),
       },
       ordersCount: orders.length,
-    });
-    console.log("EOD debrief stored ✓");
+      positions:   positionSummary,
+    }));
+    console.log("EOD debrief stored -> briefings/eod-debrief");
   } catch (err) {
     console.error("Blob store failed:", err.message);
   }
 
+  // 6. Push notification to all devices
+  if (VAPID_PUBLIC && VAPID_PRIVATE) {
+    webpush.setVapidDetails("mailto:quantedge@trading.app", VAPID_PUBLIC, VAPID_PRIVATE);
+
+    const gradeEmoji = { A: "🏆", B: "✅", C: "⚠️", D: "📉", F: "🚨" }[debrief.grade] ?? "📊";
+
+    const notification = {
+      title: `${gradeEmoji} EOD Debrief — Grade: ${debrief.grade}`,
+      body:  debrief.summary || "Market closed. Review your journal.",
+      icon:  "/icons/icon-192.png",
+      badge: "/icons/badge-72.png",
+      tag:   "eod-debrief",
+      data: {
+        url:       "https://glosamabinladen.github.io/quantedge-pro/journal.html",
+        type:      "eod",
+        grade:     debrief.grade,
+        timestamp: new Date().toISOString(),
+      },
+      actions: [
+        { action: "journal", title: "Open Journal" },
+        { action: "open",    title: "Open Terminal" },
+      ],
+    };
+
+    try {
+      const subStore = blob("push-subscriptions");
+      const { blobs } = await subStore.list();
+      let sent = 0;
+      for (const { key } of blobs) {
+        try {
+          const sub = await subStore.getJSON(key);
+          if (sub?.subscription) {
+            await webpush.sendNotification(sub.subscription, JSON.stringify(notification));
+            sent++;
+          }
+        } catch (err) {
+          if (err.statusCode === 410) {
+            await subStore.delete(key);
+            console.log(`Removed expired subscription: ${key}`);
+          }
+        }
+      }
+      console.log(`EOD push sent to ${sent} device(s)`);
+    } catch (err) {
+      console.error("Push batch failed:", err.message);
+    }
+  } else {
+    console.log("VAPID keys not set — skipping push notifications");
+  }
+
   return {
     statusCode: 200,
-    body: JSON.stringify({ success: true, debrief, dayPnl: dayPnl.toFixed(2) }),
+    body: JSON.stringify({ success: true, debrief, message: "EOD debrief complete" }),
   };
 };

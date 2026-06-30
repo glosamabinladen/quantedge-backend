@@ -1,454 +1,377 @@
 // netlify/functions/market-scanner.js
-// Scheduled: every 30 min 9:00AM–4:30PM EDT (13:00–20:30 UTC) Mon–Fri
-// Function itself enforces 9:30AM–4:00PM market hours window
-// Every run — executed, gated, or skipped — is logged to signal-log for the AUTO tab
+// SCHEDULED: every 30 min 9:00AM-4PM EDT Mon-Fri via netlify.toml
+// Function enforces the 9:30AM market open gate internally
 
 import { getStore } from "@netlify/blobs";
+import webpush from "web-push";
 
+// ── BLOBS (explicit auth required) ───────────────────────────────────────────
 const blob = (name) => getStore({
   name,
   siteID: process.env.NETLIFY_SITE_ID,
   token:  process.env.NETLIFY_AUTH_TOKEN,
 });
 
-const POLYGON_KEY  = process.env.POLYGON_API_KEY;
-const ALPACA_KEY   = process.env.ALPACA_API_KEY;
-const ALPACA_SEC   = process.env.ALPACA_API_SECRET;
-const CLAUDE_KEY   = process.env.ANTHROPIC_API_KEY;
+const POLYGON_KEY  = () => process.env.POLYGON_API_KEY;
+const ALPACA_KEY   = () => process.env.ALPACA_API_KEY;
+const ALPACA_SEC   = () => process.env.ALPACA_API_SECRET;
+const CLAUDE_KEY   = () => process.env.ANTHROPIC_API_KEY;
+const VAPID_PUBLIC = () => process.env.VAPID_PUBLIC_KEY;
+const VAPID_PRIVATE= () => process.env.VAPID_PRIVATE_KEY;
 
-const ALPACA_HEADERS = {
-  "APCA-API-KEY-ID":     ALPACA_KEY,
-  "APCA-API-SECRET-KEY": ALPACA_SEC,
+const ALPACA_HEADERS = () => ({
+  "APCA-API-KEY-ID":     ALPACA_KEY(),
+  "APCA-API-SECRET-KEY": ALPACA_SEC(),
   "Content-Type":        "application/json",
-};
+});
 
+// Broad watchlist
 const WATCHLIST = [
   "SPY","QQQ","AAPL","NVDA","TSLA","MSFT","META","AMZN","GOOGL","AMD",
-  "NFLX","PLTR","COIN","MSTR","ARM","SMCI","HOOD","SQ","PYPL","SHOP",
-  "RIVN","SOFI","UBER","SNAP","RBLX","CRM","NOW","PANW","CRWD","NET"
+  "NFLX","CRM","PLTR","RIVN","SOFI","COIN","MSTR","ARM","SMCI","HOOD",
+  "F","GM","UBER","LYFT","SNAP","RBLX","U","SHOP","SQ","PYPL"
 ];
 
-const MAX_POSITION_SIZE_PCT = 0.20;
-const MIN_CONFIDENCE        = 65;
-const MAX_LOSS_PROB         = 38;
-const MIN_RISK_REWARD       = 1.5;
-const MAX_POSITIONS         = 5;
-
-// ── Helpers ──────────────────────────────────────────────
-function nowEST(d = new Date()) {
-  return d.toLocaleTimeString("en-US", { timeZone: "America/New_York", hour12: false });
-}
-
-async function logScanEvent(payload) {
+// ── LOG SCAN EVENT to signal-log store ───────────────────────────────────────
+async function logScanEvent(data) {
   try {
     const store = blob("signal-log");
-    const key = `scan-event-${Date.now()}`;
-    await store.setJSON(key, {
+    const key   = `${Date.now()}-SCAN`;
+    await store.set(key, JSON.stringify({
       type:      "scan_event",
-      source:    "auto",
-      automated: true,
-      ...payload,
-      timestamp: payload.timestamp || new Date().toISOString(),
-    });
+      timestamp: new Date().toISOString(),
+      ...data,
+    }));
+    console.log("[scanner] Scan event logged:", key);
   } catch (e) {
-    console.warn("[scanner] logScanEvent failed:", e.message);
+    console.error("[scanner] logScanEvent failed:", e.message);
   }
 }
 
-// ─────────────────────────────────────────────────────────
 export const handler = async (event) => {
   const now = new Date();
-  const timestamp = now.toISOString();
 
-  const estHour = parseInt(new Intl.DateTimeFormat("en-US", {
-    hour: "numeric", hour12: false, timeZone: "America/New_York",
-  }).format(now));
-  // Use actual ET minute
-  const etMinStr = new Intl.DateTimeFormat("en-US", {
-    minute: "numeric", timeZone: "America/New_York",
-  }).format(now);
-  const estMin = parseInt(etMinStr);
-
+  // ── Market hours gate ─────────────────────────────────────────────────────
+  const etFmt = new Intl.DateTimeFormat("en-US", {
+    hour: "numeric", minute: "numeric", hour12: false, timeZone: "America/New_York",
+  });
+  const [estHour, estMin] = etFmt.format(now).split(":").map(Number);
   const day = now.toLocaleDateString("en-US", { weekday: "short", timeZone: "America/New_York" });
-  const isWeekday    = !["Sat", "Sun"].includes(day);
-  const isMarketOpen = isWeekday && (
+
+  const isWeekday    = !["Sat","Sun"].includes(day);
+  // Market opens at 9:30 AM ET, closes at 4:00 PM ET
+  const isMarketHours = isWeekday && (
     (estHour === 9 && estMin >= 30) ||
     (estHour >= 10 && estHour < 16)
   );
 
-  const isManual = event.httpMethod === "GET" || event.httpMethod === "POST";
-
-  // Outside market hours — log it so users see the scanner fired
-  if (!isManual && !isMarketOpen) {
-    console.log("[scanner] Outside market hours — skipping");
-    await logScanEvent({
-      timestamp,
-      scanTime:       nowEST(now),
-      skipped:        true,
-      skipReason:     "Outside market hours",
-      tickersScanned: 0,
-      setupsFound:    0,
-      tradesExecuted: 0,
-      marketBias:     "N/A",
-      scanSummary:    "Scanner fired but market is closed.",
-    });
-    return { statusCode: 200, body: JSON.stringify({ skipped: true, reason: "outside market hours" }) };
+  if (!isMarketHours) {
+    console.log(`[scanner] Outside market hours (${estHour}:${String(estMin).padStart(2,"0")} ET) — skipping`);
+    return { statusCode: 200, body: JSON.stringify({ skipped: true, reason: "outside_market_hours" }) };
   }
 
-  console.log(`[scanner] Starting scan — ${nowEST(now)} ET`);
+  console.log("[scanner] Starting market scan...");
 
-  if (!POLYGON_KEY || !ALPACA_KEY || !CLAUDE_KEY) {
-    console.error("[scanner] Missing API keys");
-    await logScanEvent({
-      timestamp, scanTime: nowEST(now), skipped: true,
-      skipReason: "Missing API keys (POLYGON, ALPACA, or ANTHROPIC)",
-      tickersScanned: 0, setupsFound: 0, tradesExecuted: 0, marketBias: "N/A",
-      scanSummary: "Scanner cannot run — one or more API keys are missing.",
-    });
-    return { statusCode: 500, body: JSON.stringify({ error: "Missing API keys" }) };
-  }
-
-  // ── 1. FETCH MARKET DATA ─────────────────────────────────
+  // 1. Fetch broad market snapshot from Polygon
   let marketData = {};
   try {
     const tickerStr = WATCHLIST.join(",");
     const r = await fetch(
-      `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?tickers=${tickerStr}&apiKey=${POLYGON_KEY}`,
-      { headers: { "User-Agent": "QuantEdge/2.0" } }
+      `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?tickers=${tickerStr}&apiKey=${POLYGON_KEY()}`
     );
     const d = await r.json();
     if (d.tickers) {
       d.tickers.forEach(t => {
-        const day  = t.day || {};
-        const prev = t.prevDay || {};
-        const price = t.lastTrade?.p || day.c || prev.c || 0;
-        const vwap  = day.vw || 0;
-        const vol   = day.v || 0;
-        const prevClose = prev.c || price;
-        if (price > 5) {
-          const change = price - prevClose;
-          const approxRsi = prevClose > 0
-            ? Math.min(100, Math.max(0, 50 + (change / prevClose) * 500))
-            : 50;
-          marketData[t.ticker] = {
-            price, open: day.o || prevClose, high: day.h || price,
-            low: day.l || price, close: day.c || price, prevClose,
-            volume: vol, vwap, changePerc: t.todaysChangePerc || 0,
-            approxRsi, vwapBias: vwap > 0 ? (price > vwap ? "ABOVE" : "BELOW") : "N/A",
-          };
-        }
+        marketData[t.ticker] = {
+          price:      t.day?.c || t.prevDay?.c || 0,
+          open:       t.day?.o || 0,
+          high:       t.day?.h || 0,
+          low:        t.day?.l || 0,
+          volume:     t.day?.v || 0,
+          vwap:       t.day?.vw || 0,
+          changePerc: t.todaysChangePerc || 0,
+          prevClose:  t.prevDay?.c || 0,
+        };
       });
     }
     console.log(`[scanner] Got data for ${Object.keys(marketData).length} tickers`);
   } catch (e) {
     console.error("[scanner] Polygon snapshot failed:", e.message);
-    await logScanEvent({
-      timestamp, scanTime: nowEST(now), skipped: true,
-      skipReason: `Market data fetch failed: ${e.message}`,
-      tickersScanned: 0, setupsFound: 0, tradesExecuted: 0, marketBias: "N/A",
-      scanSummary: "Polygon API error prevented market scan.",
-    });
-    return { statusCode: 500, body: JSON.stringify({ error: "Market data fetch failed" }) };
   }
 
-  // ── 2. SCORE MOVERS ──────────────────────────────────────
-  const scored = Object.entries(marketData)
-    .filter(([, d]) => d.volume > 300000 && d.price > 5)
-    .map(([sym, d]) => {
-      let score = 0;
-      if (d.volume > 1e6)              score += 20;
-      if (d.volume > 3e6)              score += 10;
-      if (d.approxRsi < 35)            score += 15;
-      if (d.approxRsi > 68)            score += 10;
-      if (Math.abs(d.changePerc) > 3)  score += 15;
-      if (Math.abs(d.changePerc) > 6)  score += 10;
-      if (d.vwap > 0 && Math.abs(d.price - d.vwap) / d.vwap < 0.002) score += 10;
-      return { sym, score, ...d };
-    })
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 15);
+  // 2. Find top movers
+  const movers = Object.entries(marketData)
+    .filter(([, d]) => d.price > 5 && d.volume > 500000)
+    .sort((a, b) => Math.abs(b[1].changePerc) - Math.abs(a[1].changePerc))
+    .slice(0, 12);
 
-  // ── 3. ALPACA ACCOUNT STATE ──────────────────────────────
-  let account   = { portfolio_value: 100000, cash: 100000, equity: 100000 };
-  let positions = [];
+  // 3. Fetch news for top movers
+  const newsItems = [];
   try {
-    const [accRes, posRes] = await Promise.all([
-      fetch("https://paper-api.alpaca.markets/v2/account",   { headers: ALPACA_HEADERS }),
-      fetch("https://paper-api.alpaca.markets/v2/positions", { headers: ALPACA_HEADERS }),
-    ]);
-    account   = await accRes.json();
-    positions = await posRes.json();
-    if (!Array.isArray(positions)) positions = [];
-    console.log(`[scanner] Account: $${account.portfolio_value} | ${positions.length} positions`);
+    const rssUrl = `https://feeds.finance.yahoo.com/rss/2.0/headline?s=${movers.slice(0,5).map(([s])=>s).join(",")}&region=US&lang=en-US`;
+    const rssRes = await fetch(rssUrl, { headers: { "User-Agent": "QuantEdge/1.0" } });
+    const rssText = await rssRes.text();
+    const titles  = [...rssText.matchAll(/<title><!\[CDATA\[(.+?)\]\]><\/title>/g)].map(m => m[1]).slice(0, 10);
+    const links   = [...rssText.matchAll(/<link>(.+?)<\/link>/g)].map(m => m[1]).slice(0, 10);
+    titles.forEach((t, i) => newsItems.push({ title: t, url: links[i] || "" }));
   } catch (e) {
-    console.warn("[scanner] Alpaca fetch failed:", e.message);
+    console.warn("[scanner] News fetch failed:", e.message);
   }
 
-  const cash           = parseFloat(account.cash || 100000);
-  const portfolioValue = parseFloat(account.portfolio_value || 100000);
-  const existingSymbols = positions.map(p => p.symbol);
-
-  // Max positions gate
-  if (positions.length >= MAX_POSITIONS) {
-    console.log(`[scanner] ${positions.length} positions — at max. Skipping new entries.`);
-    await logScanEvent({
-      timestamp, scanTime: nowEST(now), skipped: true,
-      skipReason: `At max positions (${positions.length}/${MAX_POSITIONS})`,
-      tickersScanned: Object.keys(marketData).length,
-      setupsFound: 0, tradesExecuted: 0, marketBias: "N/A",
-      portfolioValue: portfolioValue,
-      openPositions: existingSymbols,
-      scanSummary: `Portfolio is fully invested with ${positions.length} open positions. Waiting for exits before new entries.`,
-    });
-    return { statusCode: 200, body: JSON.stringify({ skipped: true, reason: "max positions reached", positions: positions.length }) };
-  }
-
-  // ── 4. AUTO STOP-LOSSES ──────────────────────────────────
-  for (const pos of positions) {
-    const unrealizedPct = parseFloat(pos.unrealized_plpc) * 100;
-    if (unrealizedPct < -5) {
-      try {
-        await fetch(`https://paper-api.alpaca.markets/v2/positions/${pos.symbol}`, {
-          method: "DELETE", headers: ALPACA_HEADERS,
-        });
-        console.log(`[scanner] STOP-LOSS closed ${pos.symbol} at ${unrealizedPct.toFixed(1)}%`);
-        const store = blob("trade-journal");
-        const tradeKey = `close-${pos.symbol}-${Date.now()}`;
-        await store.setJSON(tradeKey, {
-          symbol:      pos.symbol,
-          side:        "sell",
-          qty:         parseFloat(pos.qty),
-          price:       parseFloat(pos.current_price),
-          realizedPnl: parseFloat(pos.unrealized_pl),
-          reasoning:   `Auto stop-loss triggered at ${unrealizedPct.toFixed(1)}% loss`,
-          setupType:   "Stop Loss",
-          source:      "auto",
-          automated:   true,
-          timestamp,
-        });
-      } catch (e) {
-        console.error(`[scanner] Stop-loss close failed for ${pos.symbol}:`, e.message);
+  // 4. Fetch StockTwits sentiment
+  const sentiment = {};
+  for (const [sym] of movers.slice(0, 5)) {
+    try {
+      const r = await fetch(`https://api.stocktwits.com/api/2/streams/symbol/${sym}.json`);
+      const d = await r.json();
+      if (d.messages) {
+        const bulls = d.messages.filter(m => m.entities?.sentiment?.basic === "Bullish").length;
+        const bears = d.messages.filter(m => m.entities?.sentiment?.basic === "Bearish").length;
+        const total = bulls + bears;
+        sentiment[sym] = { bullPct: total > 0 ? Math.round((bulls / total) * 100) : 50, msgCount: d.messages.length };
       }
+    } catch (_) {
+      sentiment[sym] = { bullPct: 50, msgCount: 0 };
     }
   }
 
-  // ── 5. CLAUDE ANALYSIS ──────────────────────────────────
-  const moverSummary = scored.slice(0, 12).map(d => {
-    const rsiLabel = d.approxRsi < 35 ? " [OVERSOLD]" : d.approxRsi > 68 ? " [OVERBOUGHT]" : "";
-    return `${d.sym}: $${d.price.toFixed(2)} (${d.changePerc >= 0 ? "+" : ""}${d.changePerc.toFixed(2)}%) | Vol:${(d.volume/1e6).toFixed(1)}M | RSI~${d.approxRsi.toFixed(0)} | VWAP:${d.vwapBias}${rsiLabel}`;
+  // 5. Fetch Alpaca account state
+  let account = { portfolio_value: 100000, cash: 100000 };
+  let existingPositions = [];
+  try {
+    const [accRes, posRes] = await Promise.all([
+      fetch("https://paper-api.alpaca.markets/v2/account",   { headers: ALPACA_HEADERS() }),
+      fetch("https://paper-api.alpaca.markets/v2/positions", { headers: ALPACA_HEADERS() }),
+    ]);
+    account           = await accRes.json();
+    existingPositions = await posRes.json();
+  } catch (e) {
+    console.warn("[scanner] Alpaca account fetch failed:", e.message);
+  }
+
+  const cash            = parseFloat(account.cash || 100000);
+  const portfolioValue  = parseFloat(account.portfolio_value || 100000);
+  const existingSymbols = existingPositions.map(p => p.symbol);
+
+  // 6. Build market summary for Claude
+  const moverSummary = movers.map(([sym, d]) => {
+    const sent    = sentiment[sym] ? ` | Sentiment: ${sentiment[sym].bullPct}% bullish` : "";
+    const rsiNote = d.vwap > 0 ? ` | Price vs VWAP: ${d.price > d.vwap ? "ABOVE" : "BELOW"}` : "";
+    return `${sym}: $${d.price.toFixed(2)} (${d.changePerc >= 0 ? "+" : ""}${d.changePerc.toFixed(2)}%) Vol: ${(d.volume/1e6).toFixed(1)}M${rsiNote}${sent}`;
   }).join("\n");
 
-  const posSummary = positions.length
-    ? positions.map(p => `${p.symbol}: ${p.qty}sh, P&L $${parseFloat(p.unrealized_pl).toFixed(2)} (${(parseFloat(p.unrealized_plpc)*100).toFixed(1)}%)`).join(" | ")
+  const newsSummary = newsItems.length
+    ? newsItems.map(n => `• ${n.title}`).join("\n")
+    : "No news available";
+
+  const positionSummary = existingPositions.length
+    ? existingPositions.map(p => `${p.symbol}: ${p.qty} shares, P&L $${parseFloat(p.unrealized_pl).toFixed(2)}`).join(", ")
     : "None";
 
-  let plannedTrades = [];
-  let scanMeta = { marketBias: "NEUTRAL", scanSummary: "Analysis incomplete.", skipped: [] };
-
+  // 7. Ask Claude for trade decisions
+  let trades     = [];
+  let parsedScan = {};
   try {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
+    const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
-        "x-api-key": CLAUDE_KEY,
+        "Content-Type":      "application/json",
+        "x-api-key":         CLAUDE_KEY(),
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
         model:      "claude-sonnet-4-6",
-        max_tokens: 1500,
-        system: `You are QuantEdge Pro's autonomous trading AI. You analyze live market data and make precise trading decisions for a paper account. You are bold, data-driven, and focused on high-probability setups with favorable risk:reward. You enforce strict risk management: minimum 1.5:1 R:R, maximum 20% of cash per trade. You never chase momentum without technical justification.`,
+        max_tokens: 1200,
+        system: `You are QuantEdge Pro's autonomous trading AI. You analyze real market data, news, and sentiment to make precise trading decisions for a paper trading account. You are bold, data-driven, and focused on finding high-probability setups. You never place trades with >40% statistical probability of loss.`,
         messages: [{
           role: "user",
-          content: `SCAN TIME: ${nowEST(now)} ET
-PORTFOLIO: $${portfolioValue.toLocaleString()} | Cash: $${cash.toLocaleString()}
-OPEN POSITIONS (do NOT re-enter these): ${existingSymbols.join(", ") || "none"}
-CURRENT POSITIONS: ${posSummary}
+          content: `Current time: ${now.toLocaleTimeString("en-US", { timeZone: "America/New_York" })} EST
+Portfolio value: $${portfolioValue.toLocaleString()}
+Available cash: $${cash.toLocaleString()}
+Current positions: ${positionSummary}
 
-TOP MARKET MOVERS (scored by setup quality):
-${moverSummary || "No qualifying movers found above volume threshold."}
+TOP MARKET MOVERS:
+${moverSummary}
 
-TASK: Identify the 1-3 BEST trading opportunities. Requirements:
-1. Minimum confidence: ${MIN_CONFIDENCE}%
-2. Maximum loss probability: ${MAX_LOSS_PROB}%
-3. Minimum risk:reward: ${MIN_RISK_REWARD}:1
-4. Max position size: ${(MAX_POSITION_SIZE_PCT*100).toFixed(0)}% of cash
-5. Prefer setups with technical confluence (volume + price level + momentum alignment)
-6. Do NOT enter symbols already in positions
-7. If no setups meet ALL criteria, return trades: [] and explain in scanSummary
+LATEST NEWS:
+${newsSummary}
 
-Respond ONLY with this exact JSON:
+Based on this data, identify the 1-3 BEST trading opportunities right now. For each trade:
+- Confidence must be based on technical + sentiment + news confluence
+- Skip any trade with >40% statistical probability of loss
+- Position size scales with confidence (90%+ conf = up to 25% of cash, 70-89% = 10-15%, 60-69% = 5%)
+- Prefer limit orders; use market orders only for high momentum plays
+- Do NOT trade symbols already in positions: ${existingSymbols.join(", ") || "none"}
+
+Respond ONLY with this JSON (no extra text):
 {
   "trades": [
     {
       "symbol": "TICKER",
-      "side": "buy" | "sell",
-      "orderType": "limit" | "market",
+      "side": "buy" or "sell",
+      "orderType": "limit" or "market",
       "confidence": 0-100,
       "lossProbability": 0-100,
-      "cashPercent": 5-20,
+      "cashPercent": 5-25,
       "limitPrice": null or number,
       "stopLoss": number,
       "target": number,
-      "riskReward": "1:X",
-      "reasoning": "specific 1-2 sentence rationale citing data",
-      "catalysts": ["factor 1", "factor 2"],
-      "setupType": "pattern name"
+      "reasoning": "concise 1-2 sentence rationale",
+      "catalysts": ["news/sentiment/technical factor 1", "factor 2"],
+      "setupType": "pattern name e.g. Momentum Breakout, VWAP Reclaim, RSI Oversold"
     }
   ],
-  "marketBias": "BULLISH" | "BEARISH" | "NEUTRAL",
-  "scanSummary": "1-2 sentence overall read explaining what was found and why trades were/weren't taken",
-  "skipped": ["SYMBOL: reason did not meet criteria"]
+  "marketBias": "BULLISH" or "BEARISH" or "NEUTRAL",
+  "scanSummary": "1 sentence overall market read",
+  "skippedReasons": ["any high-probability setups skipped and why"]
 }`,
         }],
       }),
     });
 
-    const data = await res.json();
-    const text = data.content?.[0]?.text || "{}";
-    const parsed = JSON.parse(text.match(/\{[\s\S]*\}/)?.[0] || "{}");
-    plannedTrades = parsed.trades || [];
-    scanMeta = {
-      marketBias:  parsed.marketBias  || "NEUTRAL",
-      scanSummary: parsed.scanSummary || "No summary provided.",
-      skipped:     parsed.skipped     || [],
-    };
-    console.log(`[scanner] Claude: ${plannedTrades.length} trade(s). Bias: ${scanMeta.marketBias}`);
+    const claudeData = await claudeRes.json();
+    const text = claudeData.content?.[0]?.text || "{}";
+    parsedScan = JSON.parse(text.match(/\{[\s\S]*\}/)?.[0] || "{}");
+    trades     = parsedScan.trades || [];
+
+    // Store scan result
+    const scanStore = blob("scan-results");
+    const scanKey   = `scan-${now.toISOString().replace(/[:.]/g, "-")}`;
+    await scanStore.set(scanKey, JSON.stringify({
+      timestamp:     now.toISOString(),
+      marketBias:    parsedScan.marketBias,
+      scanSummary:   parsedScan.scanSummary,
+      movers:        movers.map(([s, d]) => ({ symbol: s, ...d })),
+      tradesPlanned: trades.length,
+      skippedReasons: parsedScan.skippedReasons || [],
+    }));
+
+    // Log scan event to signal-log so journal AUTO tab can display it
+    await logScanEvent({
+      marketBias:   parsedScan.marketBias,
+      scanSummary:  parsedScan.scanSummary,
+      moverCount:   movers.length,
+      tradesPlanned: trades.length,
+      topMovers:    movers.slice(0, 5).map(([s]) => s),
+    });
+
+    console.log(`[scanner] Claude identified ${trades.length} trade(s). Bias: ${parsedScan.marketBias}`);
   } catch (e) {
     console.error("[scanner] Claude analysis failed:", e.message);
-    await logScanEvent({
-      timestamp, scanTime: nowEST(now), skipped: true,
-      skipReason: `Claude API error: ${e.message}`,
-      tickersScanned: Object.keys(marketData).length,
-      setupsFound: 0, tradesExecuted: 0, marketBias: "N/A",
-      scanSummary: "Claude API failed — no analysis generated.",
-    });
-    return { statusCode: 500, body: JSON.stringify({ error: "Claude analysis failed", detail: e.message }) };
+    return { statusCode: 500, body: JSON.stringify({ error: e.message }) };
   }
 
-  // ── 6. EXECUTE TRADES ────────────────────────────────────
+  // 8. Execute trades on Alpaca
   const executedTrades = [];
-  const signalStore  = blob("signal-log");
-  const journalStore = blob("trade-journal");
-
-  for (const trade of plannedTrades) {
-    const scanTimestamp = new Date().toISOString();
-    const baseSignal = {
-      ticker:          trade.symbol,
-      symbol:          trade.symbol,
-      action:          (trade.side || "buy").toUpperCase(),
-      side:            trade.side,
-      confidence:      trade.confidence,
-      lossProbability: trade.lossProbability,
-      riskReward:      trade.riskReward,
-      stopLoss:        trade.stopLoss,
-      target:          trade.target,
-      reasoning:       trade.reasoning,
-      catalysts:       trade.catalysts || [],
-      setupType:       trade.setupType,
-      marketBias:      scanMeta.marketBias,
-      source:          "auto",
-      automated:       true,
-      timestamp:       scanTimestamp,
-    };
-
-    // Gate checks — log every skip
-    let gatedReason = null;
-    if ((trade.lossProbability || 100) > MAX_LOSS_PROB) {
-      gatedReason = `Loss probability ${trade.lossProbability}% exceeds ${MAX_LOSS_PROB}% max`;
-    } else if ((trade.confidence || 0) < MIN_CONFIDENCE) {
-      gatedReason = `Confidence ${trade.confidence}% below ${MIN_CONFIDENCE}% minimum`;
-    } else if (existingSymbols.includes(trade.symbol)) {
-      gatedReason = `Already in position`;
-    } else {
-      const rrParts = (trade.riskReward || "1:0").split(":");
-      const rrNum = parseFloat(rrParts[rrParts.length - 1]);
-      if (rrNum > 0 && rrNum < MIN_RISK_REWARD) {
-        gatedReason = `R:R ${trade.riskReward} below ${MIN_RISK_REWARD}:1 minimum`;
-      }
+  for (const trade of trades) {
+    if (trade.lossProbability > 40) {
+      console.log(`[scanner] SKIPPED ${trade.symbol} — loss probability ${trade.lossProbability}% > 40%`);
+      continue;
     }
-
-    if (gatedReason) {
-      console.log(`[scanner] GATED: ${trade.symbol} — ${gatedReason}`);
-      await signalStore.setJSON(`sig-gated-${trade.symbol}-${Date.now()}`, {
-        ...baseSignal, executed: false, gated: true, gatedReason,
-      }).catch(() => {});
+    if (trade.confidence < 60) {
+      console.log(`[scanner] SKIPPED ${trade.symbol} — confidence ${trade.confidence}% below threshold`);
       continue;
     }
 
-    // Execute
     try {
-      const cashPct  = Math.min(trade.cashPercent || 10, MAX_POSITION_SIZE_PCT * 100) / 100;
-      const tradeAmt = cash * cashPct;
+      const tradeAmt = cash * (trade.cashPercent / 100);
       const price    = marketData[trade.symbol]?.price || trade.limitPrice || 100;
       const qty      = Math.max(1, Math.floor(tradeAmt / price));
 
       const orderBody = {
-        symbol: trade.symbol, qty: String(qty), side: trade.side,
-        type: trade.orderType || "market", time_in_force: "day",
+        symbol:        trade.symbol,
+        qty,
+        side:          trade.side,
+        type:          trade.orderType,
+        time_in_force: "day",
       };
+
       if (trade.orderType === "limit" && trade.limitPrice) {
         orderBody.limit_price = parseFloat(trade.limitPrice.toFixed(2));
       }
 
       const orderRes = await fetch("https://paper-api.alpaca.markets/v2/orders", {
-        method: "POST", headers: ALPACA_HEADERS, body: JSON.stringify(orderBody),
+        method:  "POST",
+        headers: ALPACA_HEADERS(),
+        body:    JSON.stringify(orderBody),
       });
       const order = await orderRes.json();
 
       if (order.id) {
         const executed = {
-          ...baseSignal, orderId: order.id, qty, orderType: trade.orderType,
-          price, limitPrice: trade.limitPrice || null,
-          cashPercent: cashPct * 100, cashDeployed: tradeAmt,
-          executed: true, gated: false, status: order.status,
+          orderId:         order.id,
+          symbol:          trade.symbol,
+          side:            trade.side,
+          qty,
+          orderType:       trade.orderType,
+          price,
+          limitPrice:      trade.limitPrice,
+          stopLoss:        trade.stopLoss,
+          target:          trade.target,
+          confidence:      trade.confidence,
+          lossProbability: trade.lossProbability,
+          reasoning:       trade.reasoning,
+          catalysts:       trade.catalysts,
+          setupType:       trade.setupType,
+          cashDeployed:    tradeAmt,
+          timestamp:       new Date().toISOString(),
+          status:          order.status,
         };
         executedTrades.push(executed);
-        await journalStore.setJSON(`trade-${order.id}`, executed);
-        await signalStore.setJSON(`sig-${order.id}`, executed).catch(() => {});
-        console.log(`[scanner] EXECUTED ${trade.side.toUpperCase()} ${qty}x ${trade.symbol} @ ~$${price.toFixed(2)} | conf:${trade.confidence}% | R:R ${trade.riskReward}`);
+
+        // Log to trade-journal store
+        const journalStore = blob("trade-journal");
+        await journalStore.set(`trade-${order.id}`, JSON.stringify(executed));
+
+        // Log to signal-log store
+        const signalStore = blob("signal-log");
+        await signalStore.set(`${Date.now()}-${trade.symbol}`, JSON.stringify({
+          type:      "trade",
+          timestamp: new Date().toISOString(),
+          ...executed,
+        }));
+
+        console.log(`[scanner] EXECUTED ${trade.side.toUpperCase()} ${qty} ${trade.symbol} @ $${price.toFixed(2)} (${trade.confidence}% conf)`);
       } else {
-        await signalStore.setJSON(`sig-rejected-${trade.symbol}-${Date.now()}`, {
-          ...baseSignal, executed: false, gated: false,
-          gatedReason: `Order rejected: ${order.message || order.code || "unknown"}`,
-        }).catch(() => {});
-        console.warn(`[scanner] Order rejected for ${trade.symbol}:`, order.message || JSON.stringify(order));
+        console.warn(`[scanner] Order failed for ${trade.symbol}:`, order.message);
       }
     } catch (e) {
-      console.error(`[scanner] Execution error for ${trade.symbol}:`, e.message);
+      console.error(`[scanner] Trade execution error for ${trade.symbol}:`, e.message);
     }
   }
 
-  // ── 7. ALWAYS LOG SCAN SUMMARY ───────────────────────────
-  // Written EVERY run so the AUTO tab always shows the scanner fired
-  await logScanEvent({
-    timestamp,
-    scanTime:       nowEST(now),
-    skipped:        false,
-    tickersScanned: Object.keys(marketData).length,
-    moversScored:   scored.length,
-    setupsFound:    plannedTrades.length,
-    setupsGated:    plannedTrades.length - executedTrades.length,
-    tradesExecuted: executedTrades.length,
-    marketBias:     scanMeta.marketBias,
-    scanSummary:    scanMeta.scanSummary,
-    skippedByAI:    scanMeta.skipped,
-    portfolioValue,
-    openPositions:  existingSymbols,
-    executedSymbols: executedTrades.map(t => t.symbol),
-  });
+  // 9. Push notifications for executed trades
+  if (executedTrades.length > 0 && VAPID_PUBLIC() && VAPID_PRIVATE()) {
+    webpush.setVapidDetails("mailto:quantedge@trading.app", VAPID_PUBLIC(), VAPID_PRIVATE());
+    const tradeList = executedTrades.map(t =>
+      `${t.side.toUpperCase()} ${t.qty} ${t.symbol} @ $${t.price.toFixed(2)} (${t.confidence}% conf)`
+    ).join("\n");
 
-  console.log(`[scanner] Complete: ${executedTrades.length}/${plannedTrades.length} trades executed`);
+    try {
+      const subStore = blob("push-subscriptions");
+      const { blobs } = await subStore.list();
+      for (const { key } of blobs) {
+        const sub = await subStore.getJSON(key).catch(() => null);
+        if (sub?.subscription) {
+          await webpush.sendNotification(sub.subscription, JSON.stringify({
+            title: `◈ ${executedTrades.length} Trade${executedTrades.length > 1 ? "s" : ""} Executed`,
+            body:  tradeList,
+            tag:   "auto-trade",
+            data:  { url: "https://glosamabinladen.github.io/quantedge-pro", type: "trade" },
+          })).catch(() => {});
+        }
+      }
+    } catch (e) {
+      console.warn("[scanner] Push notification failed:", e.message);
+    }
+  }
 
   return {
     statusCode: 200,
     body: JSON.stringify({
       success:        true,
       scanned:        Object.keys(marketData).length,
-      moversFound:    scored.length,
-      tradesPlanned:  plannedTrades.length,
       tradesExecuted: executedTrades.length,
-      marketBias:     scanMeta.marketBias,
-      scanSummary:    scanMeta.scanSummary,
       trades:         executedTrades,
     }),
   };
